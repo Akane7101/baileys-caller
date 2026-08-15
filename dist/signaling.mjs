@@ -337,6 +337,8 @@ export class SignalingBridge {
         const tcToken = await this.ensureTcToken(routedPeerJid, callbackPeerJid);
         switch (usableNode.tag) {
             case "offer":
+                console.log(`[baileys-caller] handing offer ${callIdForRouting || "?"} to the WASM as peer=${routedPeerJid}` +
+                    ` (sender=${senderDeviceJid || "?"}, callback=${callbackPeerJid || "?"}, tcToken=${tcToken ? "yes" : "no"})`);
                 voip.handleSignalingOffer({
                     payload: b64,
                     peerPlatform: Number(platform || 0),

@@ -581,13 +581,59 @@ export class WasmEngine {
    */
   acceptCall = (isMicEnabled = true, isCameraEnabled = false): void => {
     this.#ensureInitialized();
+    let hasAccept = false;
+    try { hasAccept = typeof this.#instance.acceptCall === "function"; } catch {}
+    if (!hasAccept) {
+      throw new Error(
+        `WASM exposes no acceptCall; call-related methods present: ${this.callMethodNames().join(", ") || "none"}`,
+      );
+    }
     this.#instance.acceptCall(isMicEnabled, isCameraEnabled);
   };
 
   /** Decline the ringing call. */
   rejectCall = (): void => {
     this.#ensureInitialized();
+    if (typeof this.#instance.rejectCall !== "function") return;
     this.#instance.rejectCall();
+  };
+
+  /**
+   * What the WASM currently believes about the call, or null if it has none.
+   *
+   * `acceptCall` reports nothing at all, so this is the only way to distinguish
+   * "the WASM never registered the offer" from "the WASM registered it and
+   * declined to engage".
+   */
+  getCallInfo = (): unknown => {
+    if (!this.#instance) return null;
+    try {
+      return this.#instance.getCallInfo?.() ?? null;
+    } catch (err: any) {
+      return `getCallInfo threw: ${err?.message || err}`;
+    }
+  };
+
+  /**
+   * Names of call-related methods the WASM instance actually exposes.
+   *
+   * Diagnostic: a missing entry point otherwise looks identical to a call the
+   * WASM simply declined to engage, since these functions report nothing.
+   */
+  callMethodNames = (): string[] => {
+    if (!this.#instance) return [];
+    const names = new Set<string>();
+    for (let obj = this.#instance; obj; obj = Object.getPrototypeOf(obj)) {
+      for (const key of Object.getOwnPropertyNames(obj)) {
+        if (!/call/i.test(key)) continue;
+        // Emscripten installs throwing getters for symbols it did not export, so
+        // merely reading a property can abort the runtime. Probe defensively.
+        try {
+          if (typeof (this.#instance as any)[key] === "function") names.add(key);
+        } catch {}
+      }
+    }
+    return [...names].sort();
   };
 
   endCall = (reason = 0, sendTerminate = true): void => {

@@ -63,6 +63,10 @@ export declare class WasmEngine {
     acceptCall: (isMicEnabled?: boolean, isCameraEnabled?: boolean) => void;
     /** Decline the ringing call. */
     rejectCall: () => void;
+    /** What the WASM believes about the current call, or null (diagnostic). */
+    getCallInfo: () => unknown;
+    /** Names of call-related methods the WASM instance exposes (diagnostic). */
+    callMethodNames: () => string[];
     endCall: (reason?: number, sendTerminate?: boolean) => void;
     setMute: (muted: boolean) => number;
     updateNetworkMedium: (networkMedium: number, networkMtu?: number) => void;

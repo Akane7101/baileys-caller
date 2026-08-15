@@ -401,6 +401,10 @@ export class SignalingBridge {
 
     switch (usableNode.tag) {
       case "offer":
+        console.log(
+          `[baileys-caller] handing offer ${callIdForRouting || "?"} to the WASM as peer=${routedPeerJid}` +
+          ` (sender=${senderDeviceJid || "?"}, callback=${callbackPeerJid || "?"}, tcToken=${tcToken ? "yes" : "no"})`,
+        );
         voip.handleSignalingOffer({
           payload: b64,
           peerPlatform: Number(platform || 0),

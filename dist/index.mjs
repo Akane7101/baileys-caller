@@ -231,6 +231,8 @@ export class VoipClient extends EventEmitter {
     #feeder = null;
     /** Calls already seen, so a re-sent offer does not ring twice. */
     #seenIncomingCallIds = new Set();
+    /** WASM call-event types already logged, to keep the diagnostic quiet. */
+    #seenEventTypes = new Set();
     constructor(config) {
         super();
         this.#config = config;
@@ -528,6 +530,13 @@ export class VoipClient extends EventEmitter {
                 if (attempt > 0 && call._sawWasmState)
                     return;
                 attempt += 1;
+                let info;
+                try {
+                    info = this.#engine.getCallInfo();
+                }
+                catch { }
+                console.log(`[baileys-caller] accepting call ${call.callId} (attempt ${attempt}/${ACCEPT_MAX_ATTEMPTS});` +
+                    ` WASM call info: ${JSON.stringify(info ?? null).slice(0, 300)}`);
                 try {
                     this.#engine.acceptCall(withMic, false);
                 }
@@ -564,6 +573,13 @@ export class VoipClient extends EventEmitter {
     };
     // ─── private ──────────────────────────────────────────────────────────────
     #handleCallEvent = (eventType, eventData) => {
+        // Only three event types are acted on. During an inbound call the useful
+        // question is what the WASM reported at all, so anything unrecognised is
+        // logged once per type instead of being dropped in silence.
+        if (eventType !== 16 && eventType !== 156 && eventType !== 2 && !this.#seenEventTypes.has(eventType)) {
+            this.#seenEventTypes.add(eventType);
+            console.log(`[baileys-caller] unhandled WASM call event ${eventType}:`, String(eventData ?? "").slice(0, 300));
+        }
         if (eventType === 16 && eventData) {
             try {
                 const parsed = JSON.parse(eventData);
