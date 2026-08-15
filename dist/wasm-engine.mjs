@@ -693,10 +693,15 @@ export class WasmEngine {
                 const numFloats = Math.floor(bufferSize / 4);
                 if (index < 0 || index + numFloats > heapF32.length)
                     return;
-                const audioData = new Float32Array(heapF32.buffer, heapF32.byteOffset + index * 4, numFloats);
-                const hasNonZero = audioData.some((s) => Math.abs(s) > 0.0001);
+                // A view straight into WASM heap memory: the next poll (16 ms
+                // later) overwrites the same region. Anything a consumer holds
+                // on to — a queue, a batch to send over a socket — would
+                // silently read whatever landed there last, so hand out a
+                // detached copy instead of the live view.
+                const view = new Float32Array(heapF32.buffer, heapF32.byteOffset + index * 4, numFloats);
+                const hasNonZero = view.some((s) => Math.abs(s) > 0.0001);
                 if (hasNonZero)
-                    this.#config.callbacks?.onAudioPlaybackData?.(audioData);
+                    this.#config.callbacks?.onAudioPlaybackData?.(view.slice());
             }
             catch { }
         }, 16);
