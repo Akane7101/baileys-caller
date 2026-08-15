@@ -14,7 +14,15 @@ export type AudioConfig = {
 export type CallOptions = {
     /** Phone number, digits only (e.g. `"12345678901"`). */
     to: string;
-    /** Audio source: file path to MP3/WAV, or `"silence"` for an empty uplink. */
+    /**
+     * Audio source for the uplink. One of:
+     *   - a file path or URL (MP3/WAV/…), decoded by ffmpeg
+     *   - `"silence"` for an empty uplink (default)
+     *   - `"lavfi:<filtergraph>"` for an ffmpeg filter source
+     *   - `"stream:<codec>@<rate>[:<channels>]"` for audio pushed in with
+     *     `ActiveCall.writeAudio()`, e.g. `"stream:s16le@24000"` to feed the
+     *     Gemini Live API's 24 kHz PCM output into the call.
+     */
     audioSource?: string;
     /** Auto-hangup after N ms. Omit or `0` for no automatic hangup. */
     durationMs?: number;

@@ -86,6 +86,10 @@ export class ActiveCall extends EventEmitter {
 
   /** @internal mirrors the source path for the audio feeder */
   _audioSource: string = "silence";
+  /** @internal set by VoipClient; resolves the live feeder at call time */
+  _writeAudio: ((chunk: Uint8Array | Buffer) => boolean) | null = null;
+  /** @internal set by VoipClient */
+  _clearAudio: (() => number) | null = null;
 
   constructor(
     public readonly callId: string,
@@ -111,6 +115,21 @@ export class ActiveCall extends EventEmitter {
   mute = (muted: boolean): void => {
     try { this.engine.setMute(muted); } catch {}
   };
+
+  /**
+   * Push uplink audio into a call opened with a `stream:` audioSource.
+   *
+   * The PCM must match the format declared in that source, e.g.
+   * `audioSource: "stream:s16le@24000"` for the Live API's 24 kHz output.
+   * Returns false when the call has no stream source or is not capturing yet.
+   */
+  writeAudio = (chunk: Uint8Array | Buffer): boolean => this._writeAudio?.(chunk) ?? false;
+
+  /**
+   * Drop uplink audio that has not played yet, and return how many frames were
+   * discarded. Call this on a barge-in so the previous turn stops immediately.
+   */
+  clearAudio = (): number => this._clearAudio?.() ?? 0;
 
   waitForEnd = (): Promise<string> => this.#endPromise;
 
@@ -353,6 +372,9 @@ export class VoipClient {
 
     const call = new ActiveCall(callId, this.#engine, durationMs);
     call._audioSource = audioSource;
+    // Resolved lazily: the feeder only exists once the WASM starts capturing.
+    call._writeAudio = (chunk) => this.#feeder?.write(chunk) ?? false;
+    call._clearAudio = () => this.#feeder?.flush() ?? 0;
     this.#activeCall = call;
 
     this.#engine.startCall({

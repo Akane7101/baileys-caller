@@ -26,6 +26,13 @@ export declare class ActiveCall extends EventEmitter {
     get state(): CallState;
     end: () => void;
     mute: (muted: boolean) => void;
+    /**
+     * Push uplink audio into a call opened with a `stream:` audioSource.
+     * The PCM must match that source's declared format.
+     */
+    writeAudio: (chunk: Uint8Array | Buffer) => boolean;
+    /** Drop uplink audio that has not played yet; returns frames discarded. */
+    clearAudio: () => number;
     waitForEnd: () => Promise<string>;
     /** @internal — called by VoipClient on WASM call-state change */
     _updateState: (state: number) => void;
