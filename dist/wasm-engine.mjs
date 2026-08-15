@@ -529,6 +529,22 @@ export class WasmEngine {
             tcToken?.delete?.();
         }
     };
+    /**
+     * Answer the call the WASM is currently ringing on.
+     *
+     * The signalling itself (preaccept, relay election, accept) is driven inside
+     * the WASM once the offer has been handed to `handleSignalingOffer`; this
+     * only commits to the call and starts media.
+     */
+    acceptCall = (isMicEnabled = true, isCameraEnabled = false) => {
+        this.#ensureInitialized();
+        this.#instance.acceptCall(isMicEnabled, isCameraEnabled);
+    };
+    /** Decline the ringing call. */
+    rejectCall = () => {
+        this.#ensureInitialized();
+        this.#instance.rejectCall();
+    };
     endCall = (reason = 0, sendTerminate = true) => {
         this.#ensureInitialized();
         this.#instance.endCall(reason, sendTerminate);

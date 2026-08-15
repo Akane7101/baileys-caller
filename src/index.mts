@@ -101,13 +101,24 @@ export class ActiveCall extends EventEmitter {
   _writeAudio: ((chunk: Uint8Array | Buffer) => boolean) | null = null;
   /** @internal set by VoipClient */
   _clearAudio: (() => number) | null = null;
+  /** @internal set by VoipClient for a ringing inbound call */
+  _answer: ((opts: { audioSource?: string; withMic?: boolean }) => void) | null = null;
+  /** @internal set by VoipClient for a ringing inbound call */
+  _reject: (() => void) | null = null;
+
+  /** True for a call the peer placed to us. */
+  readonly incoming: boolean;
+  /** The peer, as reported by the offer. */
+  peerJid = "";
 
   constructor(
     public readonly callId: string,
     private readonly engine: WasmEngine,
     durationMs: number,
+    incoming = false,
   ) {
     super();
+    this.incoming = incoming;
     this.#endPromise = new Promise((res) => { this.#endResolver = res; });
     if (durationMs > 0) {
       this.#endTimer = setTimeout(() => this.end("timeout"), durationMs);
@@ -134,6 +145,23 @@ export class ActiveCall extends EventEmitter {
 
   mute = (muted: boolean): void => {
     try { this.engine.setMute(muted); } catch {}
+  };
+
+  /**
+   * Answer a ringing inbound call.
+   *
+   * `audioSource` behaves exactly as it does for an outbound call, including the
+   * `stream:` form for live audio. Only meaningful while the call is ringing.
+   */
+  answer = (opts: { audioSource?: string; withMic?: boolean } = {}): void => {
+    if (!this.incoming) throw new Error("answer() is only for incoming calls");
+    this._answer?.(opts);
+  };
+
+  /** Decline a ringing inbound call. */
+  reject = (): void => {
+    if (!this.incoming) throw new Error("reject() is only for incoming calls; use end()");
+    this._reject?.();
   };
 
   /**
@@ -177,8 +205,16 @@ export class ActiveCall extends EventEmitter {
   };
 }
 
-/** Top-level client. Connects to WhatsApp and lets you place calls. */
-export class VoipClient {
+/**
+ * Top-level client. Connects to WhatsApp, places calls, and emits incoming ones.
+ *
+ * Events:
+ *   `incoming` — `(call: ActiveCall)` for each inbound offer. Call `answer()` or
+ *                `reject()` on it. If nothing handles the event the call is
+ *                declined, because leaving an offer unanswered just rings out.
+ *   `error`    — `(err: Error)` for failures with nowhere else to go.
+ */
+export class VoipClient extends EventEmitter {
   readonly #config: VoipSdkConfig;
   #engine: WasmEngine | null = null;
   #relay: RelayRtcTransport | null = null;
@@ -195,7 +231,11 @@ export class VoipClient {
   #captureFramesPerChunk = 320;
   #feeder: AudioFeeder | null = null;
 
+  /** Calls already seen, so a re-sent offer does not ring twice. */
+  readonly #seenIncomingCallIds = new Set<string>();
+
   constructor(config: VoipSdkConfig) {
+    super();
     this.#config = config;
   }
 
@@ -348,7 +388,13 @@ export class VoipClient {
     try { this.#engine.updateNetworkMedium(2, 0); } catch {}
 
     this.#sock.ws.on("CB:call", (node: any) => {
+      // Order matters: the WASM must receive the offer before we can accept it.
       this.#signaling!.processIncomingCall(node, this.#engine!, this.#activeCall?.callId ?? "");
+      try {
+        this.#handleIncomingOffer(node);
+      } catch (err) {
+        this.emit("error", err instanceof Error ? err : new Error(String(err)));
+      }
     });
     this.#sock.ws.on("CB:receipt", (node: any) => {
       if (!isCallReceiptNode(node)) return;
@@ -393,21 +439,7 @@ export class VoipClient {
 
     const call = new ActiveCall(callId, this.#engine, durationMs);
     call._audioSource = audioSource;
-    // Resolved lazily: the feeder only exists once the WASM starts capturing.
-    call._writeAudio = (chunk) => this.#feeder?.write(chunk) ?? false;
-    call._clearAudio = () => this.#feeder?.flush() ?? 0;
-    this.#activeCall = call;
-
-    // Release the slot when the call ends, however it ended. Without this
-    // `#activeCall` stayed set for the lifetime of the client and every later
-    // call() threw "A call is already active." Also stops the feeder, which
-    // otherwise leaks an ffmpeg process when a call ends without the WASM
-    // reporting a capture stop.
-    call.once("ended", () => {
-      if (this.#activeCall === call) this.#activeCall = null;
-      this.#feeder?.stop();
-      this.#feeder = null;
-    });
+    this.#registerCall(call);
 
     this.#engine.startCall({
       peerJid: peerLid,
@@ -444,6 +476,91 @@ export class VoipClient {
     this.#capturePtr = 0;
     this.#captureChunkBytes = 0;
     await engine?.destroy();
+  };
+
+  /**
+   * Wire a call into the client: audio sink, active-call slot, and teardown.
+   *
+   * Shared by both directions. Without the `ended` handler `#activeCall` stayed
+   * set for the lifetime of the client and every later call() threw "A call is
+   * already active."; it also stops the feeder, which otherwise leaks an ffmpeg
+   * process when a call ends without the WASM reporting a capture stop.
+   */
+  #registerCall = (call: ActiveCall): void => {
+    // Resolved lazily: the feeder only exists once the WASM starts capturing.
+    call._writeAudio = (chunk) => this.#feeder?.write(chunk) ?? false;
+    call._clearAudio = () => this.#feeder?.flush() ?? 0;
+    this.#activeCall = call;
+
+    call.once("ended", () => {
+      if (this.#activeCall === call) this.#activeCall = null;
+      this.#feeder?.stop();
+      this.#feeder = null;
+    });
+  };
+
+  /**
+   * Turn an inbound `<offer>` into a ringing ActiveCall and emit it.
+   *
+   * The offer has already been handed to the WASM by the signalling bridge,
+   * which drives preaccept and the relay election on its own; answering only
+   * commits to the call.
+   */
+  #handleIncomingOffer = (node: any): void => {
+    const { getBinaryNodeChild, getAllBinaryNodeChildren } = this.#baileys;
+    const offer = getBinaryNodeChild(node, "offer");
+    if (!offer) return;
+
+    const callId = String(offer.attrs?.["call-id"] ?? "");
+    if (!callId || this.#seenIncomingCallIds.has(callId)) return;
+
+    // An offer-shaped "call ended" notification is not a live call; engaging it
+    // earns an accept error from the server.
+    if (offer.attrs?.is_call_ended === "1" || offer.attrs?.terminate_reason) return;
+
+    this.#seenIncomingCallIds.add(callId);
+    if (this.#seenIncomingCallIds.size > 256) {
+      this.#seenIncomingCallIds.delete(this.#seenIncomingCallIds.values().next().value as string);
+    }
+
+    const peerJid = String(offer.attrs?.["call-creator"] ?? node.attrs?.from ?? "");
+    const children = getAllBinaryNodeChildren(offer) ?? [];
+    const isVideo = children.some((c: any) => c.tag === "video");
+    const isGroup = !!offer.attrs?.["group-jid"] || children.some((c: any) => c.tag === "group_info");
+
+    const call = new ActiveCall(callId, this.#engine!, 0, true);
+    call.peerJid = peerJid;
+
+    // Only one call can be up at a time: the WASM holds a single call context.
+    if (this.#activeCall) {
+      try { this.#engine?.rejectCall(); } catch {}
+      call._forceEnd("busy");
+      return;
+    }
+
+    call._answer = ({ audioSource = "silence", withMic = true }) => {
+      call._audioSource = audioSource;
+      try {
+        this.#engine!.acceptCall(withMic, false);
+      } catch (err) {
+        this.emit("error", err instanceof Error ? err : new Error(String(err)));
+        call._forceEnd("answer_failed");
+      }
+    };
+    call._reject = () => {
+      try { this.#engine!.rejectCall(); } catch {}
+      call._forceEnd("rejected");
+    };
+
+    this.#registerCall(call);
+
+    // Nothing listening means nobody can answer, and an unanswered offer just
+    // rings out — decline it explicitly instead.
+    if (this.listenerCount("incoming") === 0) {
+      call._reject?.();
+      return;
+    }
+    this.emit("incoming", call, { isVideo, isGroup, peerJid });
   };
 
   // ─── private ──────────────────────────────────────────────────────────────

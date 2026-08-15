@@ -59,6 +59,10 @@ export declare class WasmEngine {
         isFromDialer?: boolean;
         extraData?: Uint8Array;
     }) => unknown;
+    /** Answer the ringing call; signalling is driven inside the WASM. */
+    acceptCall: (isMicEnabled?: boolean, isCameraEnabled?: boolean) => void;
+    /** Decline the ringing call. */
+    rejectCall: () => void;
     endCall: (reason?: number, sendTerminate?: boolean) => void;
     setMute: (muted: boolean) => number;
     updateNetworkMedium: (networkMedium: number, networkMtu?: number) => void;

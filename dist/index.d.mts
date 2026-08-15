@@ -22,10 +22,18 @@ export declare class ActiveCall extends EventEmitter {
     private readonly engine;
     /** @internal mirrors the source path for the audio feeder */
     _audioSource: string;
+    /** True for a call the peer placed to us. */
+    readonly incoming: boolean;
+    /** The peer, as reported by the offer. */
+    peerJid: string;
     constructor(callId: string, engine: WasmEngine, durationMs: number);
     get state(): CallState;
     end: (reason?: string) => void;
     mute: (muted: boolean) => void;
+    /** Answer a ringing inbound call. */
+    answer: (opts?: { audioSource?: string; withMic?: boolean }) => void;
+    /** Decline a ringing inbound call. */
+    reject: () => void;
     /**
      * Push uplink audio into a call opened with a `stream:` audioSource.
      * The PCM must match that source's declared format.
@@ -42,7 +50,7 @@ export declare class ActiveCall extends EventEmitter {
     _forceEnd: (reason: string) => void;
 }
 /** Top-level client. Connects to WhatsApp and lets you place calls. */
-export declare class VoipClient {
+export declare class VoipClient extends EventEmitter {
     #private;
     constructor(config: VoipSdkConfig);
     /** Connect to WhatsApp and bring up the WASM VoIP stack. */
