@@ -885,6 +885,12 @@ export class WasmEngine {
       opus_max_bandwidth: 1103, // OPUS_BANDWIDTH_WIDEBAND
     };
     const boolProps: Record<string, boolean> = {
+      // Companion-device builds can default inbound offers into a pending-call
+      // holding path. That path expects WhatsApp Web host callbacks which are not
+      // present here, so it immediately auto-rejects the offer (event 92) before
+      // acceptCall() can see a ringing call. Keep 1:1 offers on the normal call
+      // path; overlapping calls are already rejected by VoipClient.
+      enable_pending_call: false,
       enable_av_downgrade: false,
       enable_new_user_action_stanza_for_raise_hand_sender: false,
       enable_webcodec_video_encode: false,
