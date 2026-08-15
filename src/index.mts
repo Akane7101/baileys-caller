@@ -585,6 +585,11 @@ export class VoipClient extends EventEmitter {
 
     this.#registerCall(call);
 
+    console.log(
+      `[baileys-caller] incoming call ${callId} from ${peerJid}` +
+      `${isVideo ? " (video)" : ""}${isGroup ? " (group)" : ""}`,
+    );
+
     // Nothing listening means nobody can answer, and an unanswered offer just
     // rings out — decline it explicitly instead.
     if (this.listenerCount("incoming") === 0) {

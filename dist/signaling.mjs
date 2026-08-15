@@ -92,7 +92,12 @@ export class SignalingBridge {
     processIncomingCall = (node, voip, activeCallId) => {
         this.#incomingSignalingQueue = this.#incomingSignalingQueue
             .then(() => this.#doProcessIncomingCall(node, voip, activeCallId))
-            .catch(() => { });
+            .catch((err) => {
+            // Swallowing this silently made an undeliverable offer
+            // indistinguishable from a delivered one: the call would be
+            // surfaced, accepted, and then ring out because the WASM never had it.
+            console.log("[baileys-caller] failed to process an inbound call node:", err?.message || err);
+        });
         return this.#incomingSignalingQueue;
     };
     processIncomingReceipt = (node, voip, activeCallId) => {
@@ -400,8 +405,21 @@ export class SignalingBridge {
         const type = enc.attrs.type;
         if (type !== "pkmsg" && type !== "msg")
             return voipNode;
-        const candidates = [...new Set([peerJid, this.#toCallDeviceJid(peerJid)])].filter(Boolean);
+        // Calls are addressed by device, and increasingly by LID rather than
+        // phone number, so the session may live under any of these. Trying only
+        // the JID the stanza happened to carry meant a single mismatch left the
+        // call undecryptable — and therefore unanswerable.
+        const counterpart = await this.#counterpartJid(peerJid);
+        const candidates = [...new Set([
+                peerJid,
+                this.#toCallDeviceJid(peerJid),
+                this.#toPrimaryDeviceJid(peerJid),
+                counterpart,
+                counterpart ? this.#toCallDeviceJid(counterpart) : undefined,
+                counterpart ? this.#toPrimaryDeviceJid(counterpart) : undefined,
+            ])].filter(Boolean);
         let lastErr;
+        const attempts = [];
         for (const jid of candidates) {
             try {
                 const decrypted = await this.#sock.signalRepository.decryptMessage({
@@ -417,9 +435,32 @@ export class SignalingBridge {
             }
             catch (err) {
                 lastErr = err;
+                attempts.push(`${jid}: ${err?.message || err}`);
             }
         }
-        throw lastErr;
+        throw new Error(`could not decrypt the inbound call key (type=${type}); tried ${attempts.join(" | ")}`);
+    };
+    /**
+     * The other addressing form of a JID: LID for a phone number, phone number
+     * for a LID. Calls may be signalled under either, and the Signal session only
+     * exists under one of them.
+     */
+    #counterpartJid = async (jid) => {
+        const mapping = this.#sock?.signalRepository?.lidMapping;
+        if (!mapping || !jid)
+            return undefined;
+        try {
+            const bare = this.#toBareJid(jid);
+            if (jid.includes("@lid")) {
+                const pn = await mapping.getPNForLID?.(bare);
+                return pn || undefined;
+            }
+            const lid = await mapping.getLIDForPN?.(bare);
+            return lid || undefined;
+        }
+        catch {
+            return undefined;
+        }
     };
     #encryptCallKey = async (targetJid, rawCallKey, count) => {
         const { encodeWAMessage } = this.#baileys;
