@@ -64,9 +64,17 @@ const HANGUP_CONFIRM_MS = 2_000;
  * Observed when an inbound offer was auto-rejected as a pending call.
  */
 const WASM_EVENT_CALL_REJECTED = 92;
-/** Retry cadence for accepting an inbound call the WASM has not registered yet. */
-const ACCEPT_RETRY_MS = 700;
-const ACCEPT_MAX_ATTEMPTS = 4;
+/**
+ * Inbound accept timing.
+ *
+ * The WASM buffers an inbound offer and only promotes it to an active call once
+ * the relay-latency exchange has completed. `acceptCall()` on a buffered call
+ * fails with "call not active" (status 670007) and raises a CALL_ACCEPT_FAILED
+ * event, so we must wait for the call to go active before accepting — the same
+ * ordering meowcaller uses (offer -> preaccept -> relaylatency -> accept).
+ */
+const ACCEPT_POLL_MS = 250;
+const ACCEPT_WAIT_MS = 20_000;
 const isCallReceiptNode = (node) => {
     if (node?.tag !== "receipt")
         return false;
@@ -177,6 +185,8 @@ export class ActiveCall extends EventEmitter {
     waitForEnd = () => this.#endPromise;
     /** True once the WASM has reported any state for this call. */
     _sawWasmState = false;
+    /** True once acceptCall has been issued for this (active) call. */
+    _accepted = false;
     /** Whether this call has already finished. */
     get ended() { return this.#ended; }
     /** @internal — called by VoipClient on WASM call-state change */
@@ -541,39 +551,51 @@ export class VoipClient extends EventEmitter {
         }
         call._answer = ({ audioSource = "silence", withMic = true }) => {
             call._audioSource = audioSource;
-            // acceptCall() is fire-and-forget inside the WASM: if the call context
-            // is not ready yet it does nothing and reports nothing. Retry a few
-            // times until the WASM reports a state for this call, which is the
-            // only observable proof it took the offer.
-            let attempt = 0;
-            const tryAccept = () => {
-                if (call.ended || this.#activeCall !== call)
+            // The WASM buffers the offer and reports no active call (getCallInfo
+            // status 670007) until the relay-latency handshake it drives
+            // internally finishes. Accepting before then fails and tears the call
+            // down. So poll until the call goes active, then accept exactly once.
+            // Incoming signaling (relaylatency/transport) keeps being fed to the
+            // WASM meanwhile, which is what advances the call to active.
+            const deadline = Date.now() + ACCEPT_WAIT_MS;
+            let logged = false;
+            const waitThenAccept = () => {
+                if (call.ended || this.#activeCall !== call || call._accepted)
                     return;
-                if (attempt > 0 && call._sawWasmState)
-                    return;
-                attempt += 1;
                 let info;
                 try {
                     info = this.#engine.getCallInfo();
                 }
                 catch { }
-                console.log(`[baileys-caller] accepting call ${call.callId} (attempt ${attempt}/${ACCEPT_MAX_ATTEMPTS});` +
-                    ` WASM call info: ${JSON.stringify(info ?? null).slice(0, 300)}`);
-                try {
-                    this.#engine.acceptCall(withMic, false);
-                }
-                catch (err) {
-                    this.emit("error", err instanceof Error ? err : new Error(String(err)));
-                    call._forceEnd("answer_failed");
+                const active = typeof info === "string"
+                    ? info.trim().length > 0 && !info.startsWith("getCallInfo threw")
+                    : !!info;
+                if (active) {
+                    call._accepted = true;
+                    console.log(`[baileys-caller] call ${call.callId} is active; accepting now`);
+                    try {
+                        this.#engine.acceptCall(withMic, false);
+                    }
+                    catch (err) {
+                        this.emit("error", err instanceof Error ? err : new Error(String(err)));
+                        call._forceEnd("answer_failed");
+                    }
                     return;
                 }
-                if (attempt < ACCEPT_MAX_ATTEMPTS) {
-                    const t = setTimeout(tryAccept, ACCEPT_RETRY_MS);
-                    if (t.unref)
-                        t.unref();
+                if (Date.now() > deadline) {
+                    console.log(`[baileys-caller] call ${call.callId} never became active within ${ACCEPT_WAIT_MS}ms; giving up`);
+                    call._forceEnd("accept_timeout");
+                    return;
                 }
+                if (!logged) {
+                    logged = true;
+                    console.log(`[baileys-caller] answer requested for ${call.callId}; waiting for the call to go active before accepting`);
+                }
+                const t = setTimeout(waitThenAccept, ACCEPT_POLL_MS);
+                if (t.unref)
+                    t.unref();
             };
-            tryAccept();
+            waitThenAccept();
         };
         call._reject = () => {
             try {
@@ -622,15 +644,27 @@ export class VoipClient extends EventEmitter {
             this.#activeCall?._forceEnd("remote_end");
         }
         else if (eventType === WASM_EVENT_CALL_REJECTED) {
-            // The WASM declined the call itself, before it ever became an active
-            // context. Retrying acceptCall against it is pointless.
             let reason = "unknown";
             try {
                 reason = String(JSON.parse(eventData ?? "{}").reason_code ?? "unknown");
             }
             catch { }
-            console.log(`[baileys-caller] the WASM rejected call ${this.#activeCall?.callId ?? "?"} (reason ${reason})`);
-            this.#activeCall?._forceEnd(`wasm_rejected_${reason}`);
+            const call = this.#activeCall;
+            // This event also fires for a failed accept on a not-yet-active call.
+            // If we have not accepted yet, it is setup churn from an earlier
+            // build's premature accept path — ignore it and let the call keep
+            // progressing. Once we have actually accepted, it is a real rejection.
+            if (call && !call.incoming) {
+                console.log(`[baileys-caller] the WASM rejected call ${call.callId} (reason ${reason})`);
+                call._forceEnd(`wasm_rejected_${reason}`);
+            }
+            else if (call && call._accepted) {
+                console.log(`[baileys-caller] the WASM rejected accepted call ${call.callId} (reason ${reason})`);
+                call._forceEnd(`wasm_rejected_${reason}`);
+            }
+            else {
+                console.log(`[baileys-caller] WASM call-rejected event during inbound setup (reason ${reason}); not terminal, still waiting`);
+            }
         }
     };
     #handleAudioCaptureInit = (config) => {
