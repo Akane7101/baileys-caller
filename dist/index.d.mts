@@ -24,7 +24,7 @@ export declare class ActiveCall extends EventEmitter {
     _audioSource: string;
     constructor(callId: string, engine: WasmEngine, durationMs: number);
     get state(): CallState;
-    end: () => void;
+    end: (reason?: string) => void;
     mute: (muted: boolean) => void;
     /**
      * Push uplink audio into a call opened with a `stream:` audioSource.

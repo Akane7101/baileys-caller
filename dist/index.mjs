@@ -57,6 +57,8 @@ const computeHmacSha256 = (data, key) => {
     const result = createHmac("sha256", Buffer.from(key)).update(data).digest();
     return new Uint8Array(result.buffer, result.byteOffset, result.byteLength);
 };
+/** How long to wait for the WASM to confirm a local hangup before resolving. */
+const HANGUP_CONFIRM_MS = 2_000;
 const isCallReceiptNode = (node) => {
     if (node?.tag !== "receipt")
         return false;
@@ -71,7 +73,15 @@ export class ActiveCall extends EventEmitter {
     #endResolver;
     #endPromise;
     #endTimer = null;
+    #hangupTimer = null;
     #ended = false;
+    /**
+     * Set by `end()`. Kept separate from `#ended` so a local hangup does not
+     * suppress the `ended` event: marking the call ended here used to make the
+     * subsequent `_forceEnd` a no-op, so `ended` never fired and `waitForEnd()`
+     * never settled.
+     */
+    #endRequested = false;
     /** @internal mirrors the source path for the audio feeder */
     _audioSource = "silence";
     /** @internal set by VoipClient; resolves the live feeder at call time */
@@ -84,14 +94,21 @@ export class ActiveCall extends EventEmitter {
         this.engine = engine;
         this.#endPromise = new Promise((res) => { this.#endResolver = res; });
         if (durationMs > 0) {
-            this.#endTimer = setTimeout(() => this.end(), durationMs);
+            this.#endTimer = setTimeout(() => this.end("timeout"), durationMs);
         }
     }
     get state() { return this.#state; }
-    end = () => {
-        if (this.#ended)
+    /**
+     * Hang up. Idempotent.
+     *
+     * The WASM normally reports `Ending`/`Idle` straight after, which is what
+     * emits `ended`. A fallback timer resolves anyway if that report never
+     * arrives, so `waitForEnd()` cannot hang forever.
+     */
+    end = (reason = "hangup") => {
+        if (this.#ended || this.#endRequested)
             return;
-        this.#ended = true;
+        this.#endRequested = true;
         if (this.#endTimer) {
             clearTimeout(this.#endTimer);
             this.#endTimer = null;
@@ -100,6 +117,9 @@ export class ActiveCall extends EventEmitter {
             this.engine.endCall(0, true);
         }
         catch { }
+        this.#hangupTimer = setTimeout(() => this._forceEnd(reason), HANGUP_CONFIRM_MS);
+        if (this.#hangupTimer.unref)
+            this.#hangupTimer.unref();
     };
     mute = (muted) => {
         try {
@@ -142,6 +162,10 @@ export class ActiveCall extends EventEmitter {
         if (this.#endTimer) {
             clearTimeout(this.#endTimer);
             this.#endTimer = null;
+        }
+        if (this.#hangupTimer) {
+            clearTimeout(this.#hangupTimer);
+            this.#hangupTimer = null;
         }
         this.emit("ended", reason);
         this.#endResolver(reason);
@@ -351,6 +375,17 @@ export class VoipClient {
         call._writeAudio = (chunk) => this.#feeder?.write(chunk) ?? false;
         call._clearAudio = () => this.#feeder?.flush() ?? 0;
         this.#activeCall = call;
+        // Release the slot when the call ends, however it ended. Without this
+        // `#activeCall` stayed set for the lifetime of the client and every later
+        // call() threw "A call is already active." Also stops the feeder, which
+        // otherwise leaks an ffmpeg process when a call ends without the WASM
+        // reporting a capture stop.
+        call.once("ended", () => {
+            if (this.#activeCall === call)
+                this.#activeCall = null;
+            this.#feeder?.stop();
+            this.#feeder = null;
+        });
         this.#engine.startCall({
             peerJid: peerLid,
             peerPn: targetPnJid,
