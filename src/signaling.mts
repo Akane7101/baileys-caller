@@ -115,10 +115,18 @@ export class SignalingBridge {
       .catch(() => {});
   };
 
-  processIncomingCall = (node: any, voip: any, activeCallId: string): void => {
+  /**
+   * Queue an inbound `<call>` node for delivery to the WASM.
+   *
+   * Returns the queue promise: processing is serialised and can take seconds (a
+   * tc-token fetch alone allows up to TC_TOKEN_REQUEST_TIMEOUT_MS), and an
+   * inbound offer cannot be accepted before the WASM has actually received it.
+   */
+  processIncomingCall = (node: any, voip: any, activeCallId: string): Promise<void> => {
     this.#incomingSignalingQueue = this.#incomingSignalingQueue
       .then(() => this.#doProcessIncomingCall(node, voip, activeCallId))
       .catch(() => {});
+    return this.#incomingSignalingQueue;
   };
 
   processIncomingReceipt = (node: any, voip: any, activeCallId: string): void => {

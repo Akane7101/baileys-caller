@@ -59,6 +59,9 @@ const computeHmacSha256 = (data, key) => {
 };
 /** How long to wait for the WASM to confirm a local hangup before resolving. */
 const HANGUP_CONFIRM_MS = 2_000;
+/** Retry cadence for accepting an inbound call the WASM has not registered yet. */
+const ACCEPT_RETRY_MS = 700;
+const ACCEPT_MAX_ATTEMPTS = 4;
 const isCallReceiptNode = (node) => {
     if (node?.tag !== "receipt")
         return false;
@@ -167,8 +170,13 @@ export class ActiveCall extends EventEmitter {
      */
     clearAudio = () => this._clearAudio?.() ?? 0;
     waitForEnd = () => this.#endPromise;
+    /** True once the WASM has reported any state for this call. */
+    _sawWasmState = false;
+    /** Whether this call has already finished. */
+    get ended() { return this.#ended; }
     /** @internal — called by VoipClient on WASM call-state change */
     _updateState = (state) => {
+        this._sawWasmState = true;
         this.#state = state;
         if (state === CallState.PreacceptReceived)
             this.emit("ringing");
@@ -368,14 +376,15 @@ export class VoipClient extends EventEmitter {
         }
         catch { }
         this.#sock.ws.on("CB:call", (node) => {
-            // Order matters: the WASM must receive the offer before we can accept it.
-            this.#signaling.processIncomingCall(node, this.#engine, this.#activeCall?.callId ?? "");
-            try {
-                this.#handleIncomingOffer(node);
-            }
-            catch (err) {
-                this.emit("error", err instanceof Error ? err : new Error(String(err)));
-            }
+            // The WASM must have the offer before it can be accepted, and delivery
+            // is queued and can take seconds. Surfacing the call earlier meant
+            // answer() reached a WASM that had never heard of the call, so
+            // acceptCall() was a silent no-op — the call logged as answered and
+            // then just rang out.
+            const delivered = this.#signaling.processIncomingCall(node, this.#engine, this.#activeCall?.callId ?? "");
+            void delivered
+                .then(() => this.#handleIncomingOffer(node))
+                .catch((err) => this.emit("error", err instanceof Error ? err : new Error(String(err))));
         });
         this.#sock.ws.on("CB:receipt", (node) => {
             if (!isCallReceiptNode(node))
@@ -508,13 +517,32 @@ export class VoipClient extends EventEmitter {
         }
         call._answer = ({ audioSource = "silence", withMic = true }) => {
             call._audioSource = audioSource;
-            try {
-                this.#engine.acceptCall(withMic, false);
-            }
-            catch (err) {
-                this.emit("error", err instanceof Error ? err : new Error(String(err)));
-                call._forceEnd("answer_failed");
-            }
+            // acceptCall() is fire-and-forget inside the WASM: if the call context
+            // is not ready yet it does nothing and reports nothing. Retry a few
+            // times until the WASM reports a state for this call, which is the
+            // only observable proof it took the offer.
+            let attempt = 0;
+            const tryAccept = () => {
+                if (call.ended || this.#activeCall !== call)
+                    return;
+                if (attempt > 0 && call._sawWasmState)
+                    return;
+                attempt += 1;
+                try {
+                    this.#engine.acceptCall(withMic, false);
+                }
+                catch (err) {
+                    this.emit("error", err instanceof Error ? err : new Error(String(err)));
+                    call._forceEnd("answer_failed");
+                    return;
+                }
+                if (attempt < ACCEPT_MAX_ATTEMPTS) {
+                    const t = setTimeout(tryAccept, ACCEPT_RETRY_MS);
+                    if (t.unref)
+                        t.unref();
+                }
+            };
+            tryAccept();
         };
         call._reject = () => {
             try {

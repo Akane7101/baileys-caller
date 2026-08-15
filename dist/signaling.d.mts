@@ -29,7 +29,8 @@ export declare class SignalingBridge {
     attachEngine: (voip: any) => void;
     init: () => Promise<void>;
     sendSignaling: (peerJid: string, callId: string, xmlPayload: Uint8Array) => void;
-    processIncomingCall: (node: any, voip: any, activeCallId: string) => void;
+    /** Queue an inbound call node for the WASM; resolves once it has been delivered. */
+    processIncomingCall: (node: any, voip: any, activeCallId: string) => Promise<void>;
     processIncomingReceipt: (node: any, voip: any, activeCallId: string) => void;
     requestTcToken: (jid: string) => Promise<Uint8Array | undefined>;
     ensureTcToken: (...jids: string[]) => Promise<Uint8Array | undefined>;

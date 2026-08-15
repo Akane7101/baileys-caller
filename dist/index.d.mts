@@ -22,6 +22,10 @@ export declare class ActiveCall extends EventEmitter {
     private readonly engine;
     /** @internal mirrors the source path for the audio feeder */
     _audioSource: string;
+    /** True once the WASM has reported any state for this call. */
+    _sawWasmState: boolean;
+    /** Whether this call has already finished. */
+    get ended(): boolean;
     /** True for a call the peer placed to us. */
     readonly incoming: boolean;
     /** The peer, as reported by the offer. */
