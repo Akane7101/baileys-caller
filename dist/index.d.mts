@@ -46,5 +46,5 @@ export declare class VoipClient {
         durationMs?: number;
     }) => Promise<ActiveCall>;
     /** Tear down the WhatsApp socket and release resources. */
-    disconnect: () => void;
+    disconnect: () => Promise<void>;
 }

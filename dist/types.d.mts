@@ -16,7 +16,7 @@ export type CallOptions = {
     to: string;
     /** Audio source: file path to MP3/WAV, or `"silence"` for an empty uplink. */
     audioSource?: string;
-    /** Auto-hangup after N ms (default: 120000). */
+    /** Auto-hangup after N ms. Omit or `0` for no automatic hangup. */
     durationMs?: number;
 };
 /** Events emitted by an `ActiveCall`. */

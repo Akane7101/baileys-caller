@@ -40,11 +40,12 @@ export type WasmEngineConfig = {
 export declare class WasmEngine {
     #private;
     static registerGlobalCallbackListener: (callbackName: string, handler: (data: any) => void) => void;
+    static unregisterGlobalCallbackListener: (callbackName: string, handler: (data: any) => void) => void;
     static notifyGlobalCallbackListeners: (callbackName: string, data: any) => void;
     constructor(config?: WasmEngineConfig);
     initialize: () => Promise<void>;
     isInitialized: () => boolean;
-    destroy: () => void;
+    destroy: () => Promise<void>;
     initVoipStack: (selfJid: string, meUserJid: string, selfLid: string) => void;
     waitForVoipStackReady: () => Promise<void>;
     isVoipStackReady: () => boolean;

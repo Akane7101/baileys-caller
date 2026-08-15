@@ -17,7 +17,27 @@ import { fileURLToPath } from "node:url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const CALL_WASM_AB_PROPS_JSON = process.env.CALL_WASM_AB_PROPS_JSON ?? "";
-const PTHREAD_POOL_SIZE = 20;
+
+/**
+ * Size of the pre-spawned pthread pool.
+ *
+ * Each entry is a real `worker_threads` Worker: a separate V8 isolate that
+ * evaluates the ~800 KB worker bundle and instantiates the WASM module against
+ * the shared memory. On Node 22 that measures at roughly 34 MB of RSS each, so
+ * the original hard-coded 20 cost ~670 MB at startup whether or not a call was
+ * ever placed.
+ *
+ * An audio-only call needs only a handful of threads, and the Emscripten
+ * runtime allocates more on demand through `WorkerBundleResource
+ * .createDedicatedWebWorker` when the pool runs dry, so a small pool is safe.
+ * Override with `VOIP_PTHREAD_POOL_SIZE` if a workload needs more up front.
+ */
+const PTHREAD_POOL_SIZE = (() => {
+    const raw = Number.parseInt(process.env.VOIP_PTHREAD_POOL_SIZE ?? "", 10);
+    if (Number.isFinite(raw) && raw >= 0)
+        return raw;
+    return 4;
+})();
 const VOIP_READY_TIMEOUT_MS = 15_000;
 const parseJsonObjectEnv = (raw) => {
     if (!raw)
@@ -192,7 +212,6 @@ class NodeWorkerMessagePort {
 }
 export class WasmEngine {
     static #globalCallbackListeners = new Map();
-    static #globalCallbacksRegistered = false;
     static registerGlobalCallbackListener = (callbackName, handler) => {
         const key = `callback:${callbackName}`;
         let set = _a.#globalCallbackListeners.get(key);
@@ -201,6 +220,14 @@ export class WasmEngine {
             _a.#globalCallbackListeners.set(key, set);
         }
         set.add(handler);
+    };
+    static unregisterGlobalCallbackListener = (callbackName, handler) => {
+        const set = _a.#globalCallbackListeners.get(`callback:${callbackName}`);
+        if (!set)
+            return;
+        set.delete(handler);
+        if (!set.size)
+            _a.#globalCallbackListeners.delete(`callback:${callbackName}`);
     };
     static notifyGlobalCallbackListeners = (callbackName, data) => {
         const set = _a.#globalCallbackListeners.get(`callback:${callbackName}`);
@@ -220,6 +247,15 @@ export class WasmEngine {
     #vmContext = null;
     #unusedWorkers = [];
     #runningWorkers = [];
+    /**
+     * Workers the Emscripten runtime asked for itself, via
+     * `WorkerBundleResource.createDedicatedWebWorker`.
+     *
+     * These are the majority of the threads in a running engine — the
+     * pre-spawned pool is only a head start — and nothing used to keep a
+     * reference to them, so `destroy()` left them all alive.
+     */
+    #runtimeWorkers = new Set();
     #pthreads = {};
     #nextWorkerID = 1;
     #wasmModule = null;
@@ -235,6 +271,26 @@ export class WasmEngine {
     #voipReadyPromise = null;
     #workerModulesCode = "";
     #loaderCode = "";
+    /**
+     * Callbacks this instance registered in the process-wide registry.
+     *
+     * These used to be registered once per process behind a static flag, which
+     * meant a second engine (after a `destroy()` and reconnect) silently
+     * inherited the *dead* engine's handlers and never received its own — so
+     * signaling and audio went nowhere. Tracking them per instance lets
+     * destroy() unregister cleanly and a fresh engine register its own.
+     */
+    #registeredCallbacks = [];
+    #registerCallback = (name, handler) => {
+        _a.registerGlobalCallbackListener(name, handler);
+        this.#registeredCallbacks.push([name, handler]);
+    };
+    #unregisterCallbacks = () => {
+        for (const [name, handler] of this.#registeredCallbacks) {
+            _a.unregisterGlobalCallbackListener(name, handler);
+        }
+        this.#registeredCallbacks.length = 0;
+    };
     constructor(config = {}) {
         const basePath = config.resourcesPath
             ? (path.isAbsolute(config.resourcesPath) ? config.resourcesPath : path.resolve(process.cwd(), config.resourcesPath))
@@ -315,8 +371,7 @@ export class WasmEngine {
         if (typeof wasmLoader !== "function") {
             throw new Error(`No compatible WASM loader found. Tried: ${loaderModuleNames.join(", ")}`);
         }
-        if (!_a.#globalCallbacksRegistered)
-            this.#registerGlobalCallbacks();
+        this.#registerGlobalCallbacks();
         await this.#initPThreadPool();
         const workersLoadingPromise = this.#loadWasmModuleToAllWorkers();
         const readyPromise = wasmLoader({
@@ -330,7 +385,16 @@ export class WasmEngine {
         this.#initialized = true;
     };
     isInitialized = () => this.#initialized;
-    destroy = () => {
+    /**
+     * Tear the engine down and release the worker pool.
+     *
+     * Returns a promise that settles once every worker thread has actually
+     * exited. `Worker.terminate()` is asynchronous, so the previous
+     * fire-and-forget version returned while ~20 threads were still alive,
+     * leaving several hundred MB resident. Awaiting it is what makes the memory
+     * come back.
+     */
+    destroy = async () => {
         this.#stopAudioPlaybackLoop();
         if (this.#instance && typeof this.#instance.endCall === "function") {
             try {
@@ -338,19 +402,51 @@ export class WasmEngine {
             }
             catch { }
         }
-        for (const worker of [...this.#runningWorkers, ...this.#unusedWorkers]) {
-            try {
-                worker.terminate();
-            }
-            catch { }
+        // Let the runtime unwind its own pthreads first; it knows which are
+        // mid-call.
+        try {
+            this.#instance?.PThread?.terminateAllThreads?.();
         }
+        catch { }
+        // Then terminate every worker we know about. The runtime-spawned ones
+        // (#runtimeWorkers) are the bulk of them and were previously orphaned.
+        const pthreadObj = this.#instance?.PThread;
+        const workers = new Set([
+            ...this.#runningWorkers,
+            ...this.#unusedWorkers,
+            ...Object.values(this.#pthreads),
+            ...this.#runtimeWorkers,
+            ...(Array.isArray(pthreadObj?.unusedWorkers) ? pthreadObj.unusedWorkers : []),
+            ...(Array.isArray(pthreadObj?.runningWorkers) ? pthreadObj.runningWorkers : []),
+        ]);
+        this.#runtimeWorkers.clear();
         this.#runningWorkers = [];
         this.#unusedWorkers = [];
+        for (const key of Object.keys(this.#pthreads))
+            delete this.#pthreads[key];
+        await Promise.all([...workers].map(async (worker) => {
+            try {
+                const result = worker.terminate?.();
+                if (result && typeof result.then === "function")
+                    await result;
+            }
+            catch { }
+        }));
+        this.#unregisterCallbacks();
         this.#instance = null;
         this.#vmContext = null;
         this.#moduleRegistry.clear();
         this.#wasmModule = null;
         this.#wasmMemory = null;
+        this.#removeRunDependencyCallback = null;
+        this.#workersLoadedCount = 0;
+        this.#nextWorkerID = 1;
+        // Reset VoIP-stack state so a fresh initialize()/initVoipStack() pair
+        // works instead of short-circuiting on stale flags.
+        this.#voipStackInitialized = false;
+        this.#voipStackInitPromise = null;
+        this.#voipReadyPromise = null;
+        this.#voipReadyResolver = null;
         this.#initialized = false;
     };
     initVoipStack = (selfJid, meUserJid, selfLid) => {
@@ -748,7 +844,7 @@ export class WasmEngine {
     };
     #registerGlobalCallbacks = () => {
         const callbacks = this.#config.callbacks ?? {};
-        _a.registerGlobalCallbackListener("loggingCallback", (data) => {
+        this.#registerCallback("loggingCallback", (data) => {
             if (!this.#config.enableLogs)
                 return;
             const level = data?.level;
@@ -757,7 +853,7 @@ export class WasmEngine {
             callbacks.onLog?.(mapped, msg);
         });
         if (callbacks.onAudioCaptureInit) {
-            _a.registerGlobalCallbackListener("initCaptureDriverJS", (data) => {
+            this.#registerCallback("initCaptureDriverJS", (data) => {
                 callbacks.onAudioCaptureInit({
                     sampleRate: data?.sample_rate ?? data?.sampleRate,
                     channels: data?.channels,
@@ -766,10 +862,10 @@ export class WasmEngine {
                 });
             });
         }
-        _a.registerGlobalCallbackListener("startCaptureJS", () => callbacks.onAudioCaptureStart?.());
-        _a.registerGlobalCallbackListener("stopCaptureJS", () => callbacks.onAudioCaptureStop?.());
+        this.#registerCallback("startCaptureJS", () => callbacks.onAudioCaptureStart?.());
+        this.#registerCallback("stopCaptureJS", () => callbacks.onAudioCaptureStop?.());
         if (callbacks.onAudioPlaybackInit) {
-            _a.registerGlobalCallbackListener("initPlaybackDriverJS", (data) => {
+            this.#registerCallback("initPlaybackDriverJS", (data) => {
                 callbacks.onAudioPlaybackInit({
                     sampleRate: data?.sample_rate ?? data?.sampleRate,
                     channels: data?.channels,
@@ -778,16 +874,16 @@ export class WasmEngine {
                 });
             });
         }
-        _a.registerGlobalCallbackListener("startPlaybackJS", () => {
+        this.#registerCallback("startPlaybackJS", () => {
             callbacks.onAudioPlaybackStart?.();
             this.#startAudioPlaybackLoop();
         });
-        _a.registerGlobalCallbackListener("stopPlaybackJS", () => {
+        this.#registerCallback("stopPlaybackJS", () => {
             this.#stopAudioPlaybackLoop();
             callbacks.onAudioPlaybackStop?.();
         });
         if (callbacks.onSignalingXmpp) {
-            _a.registerGlobalCallbackListener("onSignalingXmpp", (data) => {
+            this.#registerCallback("onSignalingXmpp", (data) => {
                 const peerJid = data.peerJid ?? data.args?.peerJid;
                 const callId = data.callId ?? data.args?.callId;
                 let xmlPayload = data.xmlPayload ?? data.args?.xmlPayload;
@@ -801,12 +897,12 @@ export class WasmEngine {
             });
         }
         if (callbacks.onCallEvent) {
-            _a.registerGlobalCallbackListener("onCallEvent", (data) => {
+            this.#registerCallback("onCallEvent", (data) => {
                 callbacks.onCallEvent(data.eventType, data.eventDataJson);
             });
         }
         if (callbacks.sendDataToRelay) {
-            _a.registerGlobalCallbackListener("sendDataToRelay", (data) => {
+            this.#registerCallback("sendDataToRelay", (data) => {
                 let relayData = data.data ?? data.args?.data;
                 const ip = data.ip ?? data.args?.ip;
                 const portNum = data.port ?? data.args?.port;
@@ -828,7 +924,6 @@ export class WasmEngine {
                 return relayData.byteLength;
             });
         }
-        _a.#globalCallbacksRegistered = true;
     };
     #requireModule = (name) => {
         const preDefinedModules = {
@@ -856,6 +951,8 @@ export class WasmEngine {
                     });
                     worker.stdout?.on("data", () => { });
                     worker.stderr?.on("data", filterWorkerStderr);
+                    this.#runtimeWorkers.add(worker);
+                    worker.once("exit", () => this.#runtimeWorkers.delete(worker));
                     return worker;
                 },
             },

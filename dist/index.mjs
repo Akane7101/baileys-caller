@@ -172,15 +172,41 @@ export class VoipClient {
             logger: silentLogger,
         });
         // Connect with auto-reconnect on the post-QR 515 stream-error path.
-        await new Promise((resolveOpen, rejectOpen) => {
+        //
+        // The 515 handling needs a process-level hook because baileys throws it
+        // outside any promise chain, but it must not cost the host application
+        // its own crash guard: the previous `process.removeAllListeners` wiped
+        // every pre-existing uncaughtException handler permanently, so an
+        // embedding app silently lost its safety net (and died on the next
+        // unrelated throw). Instead, detach the host's handlers for the duration
+        // of the connect and put them back afterwards.
+        const hostExceptionHandlers = process.listeners("uncaughtException");
+        let ownExceptionHandler = null;
+        const restoreHostExceptionHandlers = () => {
+            if (ownExceptionHandler) {
+                process.removeListener("uncaughtException", ownExceptionHandler);
+                ownExceptionHandler = null;
+            }
+            for (const handler of hostExceptionHandlers) {
+                if (!process.listeners("uncaughtException").includes(handler)) {
+                    process.on("uncaughtException", handler);
+                }
+            }
+        };
+        try {
+            await new Promise((resolveOpen, rejectOpen) => {
             let opened = false;
             let retries = 0;
             const maxRetries = 5;
             const connectSocket = () => {
                 this.#sock = createSocket();
                 this.#sock.ev.on("creds.update", saveCreds);
-                process.removeAllListeners("uncaughtException");
-                process.on("uncaughtException", (err) => {
+                for (const handler of hostExceptionHandlers) {
+                    process.removeListener("uncaughtException", handler);
+                }
+                if (ownExceptionHandler)
+                    process.removeListener("uncaughtException", ownExceptionHandler);
+                ownExceptionHandler = (err) => {
                     const code = err?.output?.statusCode ?? err?.data?.attrs?.code;
                     if ((code === 515 || code === "515") && !opened && retries < maxRetries) {
                         retries += 1;
@@ -189,7 +215,17 @@ export class VoipClient {
                     else if (!opened) {
                         rejectOpen(err);
                     }
-                });
+                    else {
+                        // Past open: this is the host's problem again, not ours.
+                        for (const handler of hostExceptionHandlers) {
+                            try {
+                                handler(err);
+                            }
+                            catch { }
+                        }
+                    }
+                };
+                process.on("uncaughtException", ownExceptionHandler);
                 this.#sock.ev.on("connection.update", (update) => {
                     if (update.qr) {
                         void import("qrcode-terminal")
@@ -201,7 +237,7 @@ export class VoipClient {
                     }
                     if (update.connection === "open") {
                         opened = true;
-                        process.removeAllListeners("uncaughtException");
+                        restoreHostExceptionHandlers();
                         resolveOpen();
                         return;
                     }
@@ -219,7 +255,11 @@ export class VoipClient {
                 });
             };
             connectSocket();
-        });
+            });
+        }
+        finally {
+            restoreHostExceptionHandlers();
+        }
         this.#signaling = new SignalingBridge({ sock: this.#sock });
         await this.#signaling.init();
         this.#relay = new RelayRtcTransport({
@@ -266,7 +306,10 @@ export class VoipClient {
             throw new Error("A call is already active.");
         const targetNumber = phoneNumber.replace(/\D/g, "");
         const targetPnJid = `${targetNumber}@s.whatsapp.net`;
-        const durationMs = opts.durationMs ?? 120_000;
+        // No auto-hangup by default. The old default of 120_000 silently ended
+        // every call after two minutes, which reads as a bug to callers who
+        // never asked for a duration. Pass durationMs explicitly to opt in.
+        const durationMs = opts.durationMs ?? 0;
         const audioSource = opts.audioSource ?? "silence";
         const peerLid = await this.#signaling.resolveLid(targetPnJid);
         if (!peerLid)
@@ -301,16 +344,24 @@ export class VoipClient {
         return call;
     };
     /** Tear down the WhatsApp socket and release resources. */
-    disconnect = () => {
+    disconnect = async () => {
         this.#activeCall?._forceEnd("disconnect");
         this.#activeCall = null;
+        this.#feeder?.stop?.();
+        this.#feeder = null;
         this.#relay?.closeAll();
-        this.#engine?.destroy();
-        this.#sock?.end?.();
+        const engine = this.#engine;
         this.#engine = null;
         this.#relay = null;
         this.#signaling = null;
+        try {
+            this.#sock?.end?.();
+        }
+        catch { }
         this.#sock = null;
+        this.#capturePtr = 0;
+        this.#captureChunkBytes = 0;
+        await engine?.destroy();
     };
     // ─── private ──────────────────────────────────────────────────────────────
     #handleCallEvent = (eventType, eventData) => {
