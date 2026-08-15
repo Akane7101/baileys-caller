@@ -359,7 +359,17 @@ export class VoipClient extends EventEmitter {
             onTransportMessage: (data, ip, port) => this.#engine?.handleOnTransportMessage(data, ip, port),
             onIceRtt: (rttMs, ip, port) => this.#engine?.updateIceRtt(rttMs, ip, port),
         });
+        // VOIP_WASM_LOG=1 surfaces the WASM's own internal logs, filtered to the
+        // call-setup lines. This is how the WASM's reason for rejecting an
+        // inbound offer becomes visible: the reject decision (event 92) is
+        // logged inside `preprocess_offer` with a human-readable reason that is
+        // otherwise dropped, because nothing wired `onLog`. Unfiltered WASM debug
+        // output is a firehose, so a keyword filter keeps it to what matters.
+        const wasmLogEnabled = process.env.VOIP_WASM_LOG === "1";
+        const wasmLogVerbose = process.env.VOIP_WASM_LOG === "2";
+        const CALL_LOG_RE = /offer|reject|reason|preprocess|pending|contact|accept|missed|expired|silence|terminat|relay|call.?state|not.?authoriz|privacy/i;
         this.#engine = new WasmEngine({
+            options: { logLevel: wasmLogEnabled || wasmLogVerbose ? 4 : 3 },
             callbacks: {
                 onSignalingXmpp: (peerJid, callId, xmlPayload) => this.#signaling.sendSignaling(peerJid, callId, xmlPayload),
                 onCallEvent: (eventType, eventData) => this.#handleCallEvent(eventType, eventData),
@@ -368,6 +378,13 @@ export class VoipClient extends EventEmitter {
                 onAudioCaptureStart: () => this.#handleAudioCaptureStart(),
                 onAudioCaptureStop: () => this.#handleAudioCaptureStop(),
                 onAudioPlaybackData: (audioData) => this.#activeCall?._emitAudio(audioData),
+                onLog: (level, message) => {
+                    if (!wasmLogEnabled && !wasmLogVerbose)
+                        return;
+                    if (wasmLogVerbose || level === "error" || level === "warn" || CALL_LOG_RE.test(message)) {
+                        console.log(`[voip-wasm:${level}] ${String(message).slice(0, 400)}`);
+                    }
+                },
                 cryptoHkdf: computeHkdf,
                 hmacSha256: computeHmacSha256,
             },
