@@ -803,7 +803,14 @@ type WhatsAppVoipWasmWorkerCompatibleCallbacks = Record<string, (...args: any[])
   },
 
   isParticipantKnownContact: function (_t: any) {
-    return false;
+    // The main-thread predefine already answers true (wasm-engine.mts); this
+    // copy answered false, so whichever thread the WASM asked from decided
+    // whether the caller counted as a contact. An inbound offer was being
+    // auto-rejected before it could become an active call — event 92 with a
+    // reason code, `getCallInfo()` empty, and acceptCall with nothing to accept.
+    // We have no contact list to consult here, and the caller has already been
+    // vetted by the host's own answering policy, so answer consistently.
+    return true;
   },
 
   getPersistentDirectoryPath: function () {

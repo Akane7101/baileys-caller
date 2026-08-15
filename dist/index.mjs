@@ -59,6 +59,11 @@ const computeHmacSha256 = (data, key) => {
 };
 /** How long to wait for the WASM to confirm a local hangup before resolving. */
 const HANGUP_CONFIRM_MS = 2_000;
+/**
+ * WASM call event for a call it rejected on its own, carrying `reason_code`.
+ * Observed when an inbound offer was auto-rejected as a pending call.
+ */
+const WASM_EVENT_CALL_REJECTED = 92;
 /** Retry cadence for accepting an inbound call the WASM has not registered yet. */
 const ACCEPT_RETRY_MS = 700;
 const ACCEPT_MAX_ATTEMPTS = 4;
@@ -598,6 +603,17 @@ export class VoipClient extends EventEmitter {
         }
         else if (eventType === 2) {
             this.#activeCall?._forceEnd("remote_end");
+        }
+        else if (eventType === WASM_EVENT_CALL_REJECTED) {
+            // The WASM declined the call itself, before it ever became an active
+            // context. Retrying acceptCall against it is pointless.
+            let reason = "unknown";
+            try {
+                reason = String(JSON.parse(eventData ?? "{}").reason_code ?? "unknown");
+            }
+            catch { }
+            console.log(`[baileys-caller] the WASM rejected call ${this.#activeCall?.callId ?? "?"} (reason ${reason})`);
+            this.#activeCall?._forceEnd(`wasm_rejected_${reason}`);
         }
     };
     #handleAudioCaptureInit = (config) => {
