@@ -75,6 +75,9 @@ const WASM_EVENT_CALL_REJECTED = 92;
  */
 const ACCEPT_POLL_MS = 250;
 const ACCEPT_WAIT_MS = 20_000;
+/** Liveness watchdog for a connected call. */
+const WATCHDOG_INTERVAL_MS = 5_000;
+const WATCHDOG_MISS_LIMIT = 2;
 const isCallReceiptNode = (node) => {
     if (node?.tag !== "receipt")
         return false;
@@ -410,6 +413,10 @@ export class VoipClient extends EventEmitter {
         }
         catch { }
         this.#sock.ws.on("CB:call", (node) => {
+            // A peer hangup/decline arrives as <call><terminate>/<reject>. The
+            // WASM ignores it when it has no active call, so the active call would
+            // otherwise never end. End it here directly, before feeding onward.
+            this.#endActiveCallOnPeerTerminate(node);
             // The WASM must have the offer before it can be accepted, and delivery
             // is queued and can take seconds. Surfacing the call earlier meant
             // answer() reached a WASM that had never heard of the call, so
@@ -504,7 +511,46 @@ export class VoipClient extends EventEmitter {
         call._writeAudio = (chunk) => this.#feeder?.write(chunk) ?? false;
         call._clearAudio = () => this.#feeder?.flush() ?? 0;
         this.#activeCall = call;
+        // Liveness watchdog: once connected, confirm the WASM still has an active
+        // call. If getCallInfo reports none twice in a row the call has ended
+        // without a terminate we could see (network drop, internal WASM end), so
+        // end it here rather than leave the session and feeder running forever.
+        let watchdog = null;
+        let misses = 0;
+        call.on("connected", () => {
+            if (watchdog)
+                return;
+            watchdog = setInterval(() => {
+                if (call.ended) {
+                    if (watchdog)
+                        clearInterval(watchdog);
+                    return;
+                }
+                let info;
+                try {
+                    info = this.#engine?.getCallInfo();
+                }
+                catch { }
+                const active = typeof info === "string"
+                    ? info.trim().length > 0 && !info.startsWith("getCallInfo threw")
+                    : !!info;
+                if (active) {
+                    misses = 0;
+                    return;
+                }
+                if (++misses >= WATCHDOG_MISS_LIMIT) {
+                    console.log(`[baileys-caller] call ${call.callId} has no active call context; ending (watchdog)`);
+                    call._forceEnd("call_gone");
+                }
+            }, WATCHDOG_INTERVAL_MS);
+            if (watchdog.unref)
+                watchdog.unref();
+        });
         call.once("ended", () => {
+            if (watchdog) {
+                clearInterval(watchdog);
+                watchdog = null;
+            }
             if (this.#activeCall === call)
                 this.#activeCall = null;
             this.#feeder?.stop();
@@ -518,6 +564,55 @@ export class VoipClient extends EventEmitter {
      * which drives preaccept and the relay election on its own; answering only
      * commits to the call.
      */
+    /**
+     * End the active call when the peer sends a terminate/reject for it.
+     *
+     * Guards against the "call ended but the bot never disconnected" case: the
+     * WASM drops these stanzas when it has no matching active call, so the call
+     * object here has to react to them itself.
+     */
+    /**
+     * Decline a call on the wire with `<call><reject call-id call-creator>`.
+     *
+     * Uses Baileys' native rejectCall when present, otherwise builds the same
+     * stanza directly. This is what actually stops the caller's phone ringing;
+     * the WASM's rejectCall does nothing for a never-activated inbound call.
+     */
+    #sendRejectStanza = async (callId, peerJid) => {
+        if (!callId || !peerJid)
+            return;
+        try {
+            if (typeof this.#sock.rejectCall === "function") {
+                await this.#sock.rejectCall(callId, peerJid);
+                return;
+            }
+            const me = this.#sock.authState?.creds?.me?.id;
+            await this.#sock.sendNode({
+                tag: "call",
+                attrs: { ...(me ? { from: me } : {}), to: peerJid },
+                content: [{ tag: "reject", attrs: { "call-id": callId, "call-creator": peerJid, count: "0" } }],
+            });
+        }
+        catch (err) {
+            console.log("[baileys-caller] reject stanza failed:", err?.message || err);
+        }
+    };
+    #endActiveCallOnPeerTerminate = (node) => {
+        const call = this.#activeCall;
+        if (!call)
+            return;
+        const { getAllBinaryNodeChildren } = this.#baileys;
+        for (const child of getAllBinaryNodeChildren(node) ?? []) {
+            if (child.tag !== "terminate" && child.tag !== "reject")
+                continue;
+            const childCallId = String(child.attrs?.["call-id"] ?? "");
+            if (childCallId && call.callId && childCallId !== call.callId)
+                continue;
+            console.log(`[baileys-caller] peer ${child.tag} for call ${call.callId}; ending`);
+            call._forceEnd(child.tag === "reject" ? "peer_rejected" : "peer_ended");
+            return;
+        }
+    };
     #handleIncomingOffer = (node) => {
         const { getBinaryNodeChild, getAllBinaryNodeChildren } = this.#baileys;
         const offer = getBinaryNodeChild(node, "offer");
@@ -598,6 +693,12 @@ export class VoipClient extends EventEmitter {
             waitThenAccept();
         };
         call._reject = () => {
+            // The WASM's rejectCall is a no-op when it never made the call active
+            // (which is always, for inbound), so it never actually declined on
+            // the wire. Send the real <call><reject> stanza too — the same one
+            // WhatsApp Web / meowcaller send — so the caller's phone stops
+            // ringing.
+            void this.#sendRejectStanza(call.callId, call.peerJid);
             try {
                 this.#engine.rejectCall();
             }
