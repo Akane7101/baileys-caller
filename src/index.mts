@@ -18,9 +18,9 @@ import { WasmEngine } from "./wasm-engine.mjs";
 import { RelayRtcTransport, type RelayListUpdatePayload } from "./relay-transport.mjs";
 import { SignalingBridge } from "./signaling.mjs";
 import { AudioFeeder } from "./audio-feeder.mjs";
-import { CallState, type VoipSdkConfig } from "./types.mjs";
+import { CallState, type VoipSdkConfig, type GroupCallOptions } from "./types.mjs";
 
-export type { VoipSdkConfig, CallOptions, CallEvents, AudioConfig } from "./types.mjs";
+export type { VoipSdkConfig, CallOptions, CallEvents, AudioConfig, GroupCallOptions, VideoFrame } from "./types.mjs";
 export { CallState } from "./types.mjs";
 
 const SHA256_LEN = 32;
@@ -185,6 +185,34 @@ export class ActiveCall extends EventEmitter {
     if (!this.incoming) throw new Error("reject() is only for incoming calls; use end()");
     this._reject?.();
   };
+
+  /** True for a group call (ad-hoc or group-bound). */
+  isGroup = false;
+  /** @internal set by VoipClient for group calls. */
+  _addParticipant: ((phoneNumber: string) => Promise<void>) | null = null;
+  /** @internal set by VoipClient for group calls. */
+  _removeParticipant: ((jid: string) => void) | null = null;
+
+  /** Add a participant to a group call by phone number (digits only). */
+  addParticipant = async (phoneNumber: string): Promise<void> => {
+    if (!this.isGroup) throw new Error("addParticipant() is only for group calls");
+    await this._addParticipant?.(phoneNumber);
+  };
+
+  /** Remove a participant from a group call by their JID. */
+  removeParticipant = (jid: string): void => {
+    if (!this.isGroup) throw new Error("removeParticipant() is only for group calls");
+    this._removeParticipant?.(jid);
+  };
+
+  /** Ask the peer to upgrade this audio call to video. */
+  requestVideo = (): void => { this.engine.requestVideoUpgrade(); };
+
+  /** Accept a peer's incoming video (mid-call upgrade or a group participant). */
+  acceptVideo = (jid: string): void => { this.engine.acceptPeerVideo(jid); };
+
+  /** Toggle our own outgoing video track. */
+  setVideoMute = (enable: boolean): void => { this.engine.setVideoMute(enable); };
 
   /**
    * Push uplink audio into a call opened with a `stream:` audioSource.
@@ -417,6 +445,7 @@ export class VoipClient extends EventEmitter {
         onAudioCaptureStart: () => this.#handleAudioCaptureStart(),
         onAudioCaptureStop: () => this.#handleAudioCaptureStop(),
         onAudioPlaybackData: (audioData) => this.#activeCall?._emitAudio(audioData),
+        onVideoFrame: (frame) => this.#activeCall?.emit("video", frame),
         onLog: (level: string, message: string) => {
           if (!wasmLogEnabled && !wasmLogVerbose) return;
           if (wasmLogVerbose || level === "error" || level === "warn" || CALL_LOG_RE.test(message)) {
@@ -515,11 +544,72 @@ export class VoipClient extends EventEmitter {
   };
 
   /**
-   * Tear down the WhatsApp socket and release resources.
+   * Place an outbound group call.
    *
-   * Await the returned promise if you care about the memory actually coming
-   * back: engine teardown has to wait for ~20 worker threads to exit.
+   * Needs at least two other participants (WhatsApp's minimum for an initial
+   * group offer is self + 2). The WASM owns the group key epoch, SRTP, and relay
+   * subscriptions; this only resolves each participant's device roster and hands
+   * it over. Pass `groupJid` to bind the call to an existing group, or omit it
+   * for an ad-hoc group call.
    */
+  callGroup = async (
+    phoneNumbers: string[],
+    opts: GroupCallOptions = {},
+  ): Promise<ActiveCall> => {
+    if (!this.#engine || !this.#signaling) throw new Error("Not connected. Call connect() first.");
+    if (this.#activeCall) throw new Error("A call is already active.");
+
+    const numbers = [...new Set(phoneNumbers.map((n) => n.replace(/\D/g, "")).filter(Boolean))];
+    if (numbers.length < 2) throw new Error("A group call needs at least two other participants.");
+
+    const pnUserJids: string[] = [];
+    const lidUserJids: string[] = [];
+    const deviceJidsCsv: string[] = [];
+    const allDevices: string[] = [];
+
+    for (const number of numbers) {
+      const resolved = await this.#signaling.resolveGroupParticipant(`${number}@s.whatsapp.net`);
+      if (!resolved) throw new Error(`Could not resolve LID for ${number}`);
+      pnUserJids.push(resolved.pn);
+      lidUserJids.push(resolved.lid);
+      deviceJidsCsv.push(resolved.deviceCsv);
+      if (resolved.deviceCsv) allDevices.push(...resolved.deviceCsv.split(","));
+    }
+
+    if (allDevices.length) await this.#signaling.ensureSessionsForPeers(allDevices);
+
+    const callId = ("00" + randomBytes(16).toString("hex").slice(2)).toUpperCase();
+    const call = new ActiveCall(callId, this.#engine, opts.durationMs ?? 0);
+    call._audioSource = "silence";
+    call.isGroup = true;
+    this.#registerCall(call);
+    this.#registerGroupControls(call);
+
+    this.#engine.startGroupCall({
+      pnUserJids, lidUserJids, deviceJidsCsv, callId,
+      isVideo: !!opts.video, groupJid: opts.groupJid,
+    });
+
+    return call;
+  };
+
+  /** Wire add/remove-participant controls onto a group ActiveCall. */
+  #registerGroupControls = (call: ActiveCall): void => {
+    call._addParticipant = async (phoneNumber: string): Promise<void> => {
+      if (!this.#engine || !this.#signaling) return;
+      const number = phoneNumber.replace(/\D/g, "");
+      const resolved = await this.#signaling.resolveGroupParticipant(`${number}@s.whatsapp.net`);
+      if (!resolved) throw new Error(`Could not resolve LID for ${number}`);
+      const devices = resolved.deviceCsv ? resolved.deviceCsv.split(",") : [];
+      if (devices.length) await this.#signaling.ensureSessionsForPeers(devices);
+      this.#engine.inviteToCall(resolved.pn, resolved.lid, devices);
+    };
+    call._removeParticipant = (jid: string): void => {
+      this.#engine?.removeCallParticipant(jid);
+    };
+  };
+
+
   disconnect = async (): Promise<void> => {
     this.#activeCall?._forceEnd("disconnect");
     this.#activeCall = null;
@@ -660,6 +750,8 @@ export class VoipClient extends EventEmitter {
 
     const call = new ActiveCall(callId, this.#engine!, 0, true);
     call.peerJid = peerJid;
+    call.isGroup = isGroup;
+    if (isGroup) this.#registerGroupControls(call);
 
     // Only one call can be up at a time: the WASM holds a single call context.
     if (this.#activeCall) {

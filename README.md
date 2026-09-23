@@ -12,9 +12,9 @@ Wraps WhatsApp Web's official VoIP WASM stack and uses [Baileys](https://github.
 - ✅ Stream audio from MP3/WAV files
 - ✅ Receive remote audio as `Float32Array`
 - ✅ Mute / unmute / hang up
-- ❌ Group calls
-- ❌ Video
-- ❌ Inbound calls
+- ✅ Inbound calls
+- ✅ Group calls (ad-hoc / group-bound; add & remove participants)
+- 🟡 Video: negotiation + receiving encoded H.264 frames only (no headless capture/encode)
 
 ## Requirements
 
@@ -99,29 +99,54 @@ Places an outbound call. `phoneNumber` is digits only (e.g. `"12345678901"`).
 
 Closes the WhatsApp socket and releases resources.
 
+### `client.callGroup(phoneNumbers, opts?): Promise<ActiveCall>`
+
+Places an outbound group call. `phoneNumbers` is an array of digits-only numbers; at least two are required (WhatsApp's minimum for an initial group offer is you + 2).
+
+| Option       | Type       | Description                                                  |
+|--------------|------------|-------------------------------------------------------------|
+| `video`      | `boolean?` | Advertise video in the offer                                |
+| `groupJid`   | `string?`  | Bind to an existing group (`…@g.us`); omit for ad-hoc       |
+| `durationMs` | `number?`  | Auto-hangup after N ms                                      |
+
+The WASM owns the group key epoch, SRTP, and relay subscriptions — this only resolves each participant's device roster and hands it over.
+
 ### `ActiveCall`
 
-Returned by `client.call()`. Extends `EventEmitter`.
+Returned by `client.call()` and `client.callGroup()`. Extends `EventEmitter`.
 
 #### Events
 
-| Event       | Payload         | When                                          |
-|-------------|-----------------|-----------------------------------------------|
-| `ringing`   | —               | Remote device is ringing                      |
-| `connected` | —               | Call answered, media flowing                  |
-| `audio`     | `Float32Array`  | 16 kHz mono PCM frame from the remote peer    |
-| `ended`     | `string`        | Call ended (`hangup`, `timeout`, `rejected`)  |
-| `error`     | `Error`         | Fatal error                                   |
+| Event         | Payload         | When                                          |
+|---------------|-----------------|-----------------------------------------------|
+| `ringing`     | —               | Remote device is ringing                      |
+| `connected`   | —               | Call answered, media flowing                  |
+| `audio`       | `Float32Array`  | 16 kHz mono PCM frame from the remote peer    |
+| `video`       | `VideoFrame`    | Encoded H.264 access unit from a peer (not decoded to pixels) |
+| `ended`       | `string`        | Call ended (`hangup`, `timeout`, `rejected`)  |
+| `error`       | `Error`         | Fatal error                                   |
 
 #### Methods
 
 - `call.end(): void` — hang up
 - `call.mute(muted: boolean): void` — toggle outgoing mute
 - `call.waitForEnd(): Promise<string>` — resolves with end reason
+- `call.answer(opts?): void` / `call.reject(): void` — for incoming calls
+- `call.addParticipant(phoneNumber): Promise<void>` — group calls only
+- `call.removeParticipant(jid): void` — group calls only
+- `call.requestVideo(): void` — ask the peer to upgrade to video
+- `call.acceptVideo(jid): void` — accept a peer's incoming video
+- `call.setVideoMute(enable): void` — toggle our own outgoing video track
 
 #### Properties
 
 - `call.callId: string`
+- `call.incoming: boolean`
+- `call.isGroup: boolean`
+
+### Video support
+
+Video is **signaling + receive-only** in this headless build. You can negotiate video (offer/upgrade/accept) and receive peers' encoded H.264 access units through the `video` event, but the WASM's browser-only capture/encode (`WebCodecs`) and pixel decode paths are disabled — so you cannot send camera video or get decoded images without wiring an external codec.
 
 ## How it works
 

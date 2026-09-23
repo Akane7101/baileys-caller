@@ -198,6 +198,21 @@ export class SignalingBridge {
     return this.#normalizeStartCallPeerList(devices.map((d: any) => d.jid).filter(Boolean));
   };
 
+  /**
+   * Resolve one group-call target into the parallel wire lists the WASM's
+   * `startVoipGroupCall` / `joinVoipOngoingCall` expect: its PN JID, LID JID,
+   * and a comma-separated list of its device JIDs.
+   */
+  resolveGroupParticipant = async (
+    pnJid: string,
+  ): Promise<{ pn: string; lid: string; deviceCsv: string } | null> => {
+    const pn = this.#toBareJid(pnJid);
+    const lid = (await this.resolveLid(pn)) ?? "";
+    if (!lid) return null;
+    const devices = await this.discoverPeerDevices(lid);
+    return { pn, lid: this.#toBareJid(lid), deviceCsv: devices.join(",") };
+  };
+
   ensureSessionsForPeers = async (jids: string[]): Promise<void> => {
     const targets = this.#expandSignalSessionTargets(jids);
     if (targets.length) await this.#ensureSignalSessions(targets, true);

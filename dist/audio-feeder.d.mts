@@ -17,10 +17,23 @@ export declare class AudioFeeder {
     constructor(sampleRate: number, channels: number, framesPerChunk: number, onChunk: (chunk: Float32Array) => void, source?: string);
     start: () => void;
     stop: () => void;
-    /** Push raw PCM in the format declared by a `stream:` source. */
+    /**
+     * Push raw PCM in the format declared by a `stream:` source.
+     *
+     * Input is downmixed to mono if needed and resampled to the call's capture
+     * rate. Returns false when there is no stream source or the feeder is stopped.
+     */
     write: (chunk: Uint8Array | Buffer) => boolean;
     /** Signal end of input on a stream source. */
     endInput: () => void;
-    /** Drop audio not yet sent to the call; returns the number of chunks dropped. */
+    /**
+     * Drop audio that has not been sent to the call yet, and return how many
+     * chunks were discarded.
+     *
+     * Used for barge-in: the outbound queue holds up to MAX_QUEUED_CHUNKS frames
+     * (about 20 seconds at 20 ms per frame), so without this the previous turn
+     * would keep playing long after the peer interrupted. For stream sources this
+     * clears everything, including partially resampled audio.
+     */
     flush: () => number;
 }

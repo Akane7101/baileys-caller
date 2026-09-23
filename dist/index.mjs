@@ -117,9 +117,9 @@ export class ActiveCall extends EventEmitter {
     peerJid = "";
     constructor(callId, engine, durationMs, incoming = false) {
         super();
-        this.incoming = incoming;
         this.callId = callId;
         this.engine = engine;
+        this.incoming = incoming;
         this.#endPromise = new Promise((res) => { this.#endResolver = res; });
         if (durationMs > 0) {
             this.#endTimer = setTimeout(() => this.end("timeout"), durationMs);
@@ -158,8 +158,8 @@ export class ActiveCall extends EventEmitter {
     /**
      * Answer a ringing inbound call.
      *
-     * `audioSource` behaves exactly as it does for an outbound call, including
-     * the `stream:` form for live audio. Only meaningful while ringing.
+     * `audioSource` behaves exactly as it does for an outbound call, including the
+     * `stream:` form for live audio. Only meaningful while the call is ringing.
      */
     answer = (opts = {}) => {
         if (!this.incoming)
@@ -172,6 +172,30 @@ export class ActiveCall extends EventEmitter {
             throw new Error("reject() is only for incoming calls; use end()");
         this._reject?.();
     };
+    /** True for a group call (ad-hoc or group-bound). */
+    isGroup = false;
+    /** @internal set by VoipClient for group calls. */
+    _addParticipant = null;
+    /** @internal set by VoipClient for group calls. */
+    _removeParticipant = null;
+    /** Add a participant to a group call by phone number (digits only). */
+    addParticipant = async (phoneNumber) => {
+        if (!this.isGroup)
+            throw new Error("addParticipant() is only for group calls");
+        await this._addParticipant?.(phoneNumber);
+    };
+    /** Remove a participant from a group call by their JID. */
+    removeParticipant = (jid) => {
+        if (!this.isGroup)
+            throw new Error("removeParticipant() is only for group calls");
+        this._removeParticipant?.(jid);
+    };
+    /** Ask the peer to upgrade this audio call to video. */
+    requestVideo = () => { this.engine.requestVideoUpgrade(); };
+    /** Accept a peer's incoming video (mid-call upgrade or a group participant). */
+    acceptVideo = (jid) => { this.engine.acceptPeerVideo(jid); };
+    /** Toggle our own outgoing video track. */
+    setVideoMute = (enable) => { this.engine.setVideoMute(enable); };
     /**
      * Push uplink audio into a call opened with a `stream:` audioSource.
      *
@@ -280,12 +304,12 @@ export class VoipClient extends EventEmitter {
         // Connect with auto-reconnect on the post-QR 515 stream-error path.
         //
         // The 515 handling needs a process-level hook because baileys throws it
-        // outside any promise chain, but it must not cost the host application
-        // its own crash guard: the previous `process.removeAllListeners` wiped
-        // every pre-existing uncaughtException handler permanently, so an
-        // embedding app silently lost its safety net (and died on the next
-        // unrelated throw). Instead, detach the host's handlers for the duration
-        // of the connect and put them back afterwards.
+        // outside any promise chain, but it must not cost the host application its
+        // own crash guard: the previous `process.removeAllListeners` wiped every
+        // pre-existing uncaughtException handler permanently, so an embedding app
+        // silently lost its safety net (and died on the next unrelated throw).
+        // Instead, detach the host's handlers for the duration of the connect and
+        // put them back afterwards.
         const hostExceptionHandlers = process.listeners("uncaughtException");
         let ownExceptionHandler = null;
         const restoreHostExceptionHandlers = () => {
@@ -301,66 +325,66 @@ export class VoipClient extends EventEmitter {
         };
         try {
             await new Promise((resolveOpen, rejectOpen) => {
-            let opened = false;
-            let retries = 0;
-            const maxRetries = 5;
-            const connectSocket = () => {
-                this.#sock = createSocket();
-                this.#sock.ev.on("creds.update", saveCreds);
-                for (const handler of hostExceptionHandlers) {
-                    process.removeListener("uncaughtException", handler);
-                }
-                if (ownExceptionHandler)
-                    process.removeListener("uncaughtException", ownExceptionHandler);
-                ownExceptionHandler = (err) => {
-                    const code = err?.output?.statusCode ?? err?.data?.attrs?.code;
-                    if ((code === 515 || code === "515") && !opened && retries < maxRetries) {
-                        retries += 1;
-                        setTimeout(connectSocket, 1500);
+                let opened = false;
+                let retries = 0;
+                const maxRetries = 5;
+                const connectSocket = () => {
+                    this.#sock = createSocket();
+                    this.#sock.ev.on("creds.update", saveCreds);
+                    for (const handler of hostExceptionHandlers) {
+                        process.removeListener("uncaughtException", handler);
                     }
-                    else if (!opened) {
-                        rejectOpen(err);
-                    }
-                    else {
-                        // Past open: this is the host's problem again, not ours.
-                        for (const handler of hostExceptionHandlers) {
-                            try {
-                                handler(err);
-                            }
-                            catch { }
-                        }
-                    }
-                };
-                process.on("uncaughtException", ownExceptionHandler);
-                this.#sock.ev.on("connection.update", (update) => {
-                    if (update.qr) {
-                        void import("qrcode-terminal")
-                            .then((qrt) => (qrt.default ?? qrt).generate(update.qr, { small: true }))
-                            .catch(() => {
-                            console.log("Scan this QR code in WhatsApp > Linked Devices:");
-                            console.log(update.qr);
-                        });
-                    }
-                    if (update.connection === "open") {
-                        opened = true;
-                        restoreHostExceptionHandlers();
-                        resolveOpen();
-                        return;
-                    }
-                    if (update.connection === "close" && !opened) {
-                        const statusCode = update.lastDisconnect?.error?.output?.statusCode;
-                        const shouldReconnect = statusCode === 515 || statusCode === DisconnectReason?.restartRequired;
-                        if (shouldReconnect && retries < maxRetries) {
+                    if (ownExceptionHandler)
+                        process.removeListener("uncaughtException", ownExceptionHandler);
+                    ownExceptionHandler = (err) => {
+                        const code = err?.output?.statusCode ?? err?.data?.attrs?.code;
+                        if ((code === 515 || code === "515") && !opened && retries < maxRetries) {
                             retries += 1;
-                            setTimeout(connectSocket, 1000);
+                            setTimeout(connectSocket, 1500);
+                        }
+                        else if (!opened) {
+                            rejectOpen(err);
                         }
                         else {
-                            rejectOpen(update.lastDisconnect?.error ?? new Error("socket closed before open"));
+                            // Past open: this is the host's problem again, not ours.
+                            for (const handler of hostExceptionHandlers) {
+                                try {
+                                    handler(err);
+                                }
+                                catch { }
+                            }
                         }
-                    }
-                });
-            };
-            connectSocket();
+                    };
+                    process.on("uncaughtException", ownExceptionHandler);
+                    this.#sock.ev.on("connection.update", (update) => {
+                        if (update.qr) {
+                            void import("qrcode-terminal")
+                                .then((qrt) => (qrt.default ?? qrt).generate(update.qr, { small: true }))
+                                .catch(() => {
+                                console.log("Scan this QR code in WhatsApp > Linked Devices:");
+                                console.log(update.qr);
+                            });
+                        }
+                        if (update.connection === "open") {
+                            opened = true;
+                            restoreHostExceptionHandlers();
+                            resolveOpen();
+                            return;
+                        }
+                        if (update.connection === "close" && !opened) {
+                            const statusCode = update.lastDisconnect?.error?.output?.statusCode;
+                            const shouldReconnect = statusCode === 515 || statusCode === DisconnectReason?.restartRequired;
+                            if (shouldReconnect && retries < maxRetries) {
+                                retries += 1;
+                                setTimeout(connectSocket, 1000);
+                            }
+                            else {
+                                rejectOpen(update.lastDisconnect?.error ?? new Error("socket closed before open"));
+                            }
+                        }
+                    });
+                };
+                connectSocket();
             });
         }
         finally {
@@ -373,11 +397,11 @@ export class VoipClient extends EventEmitter {
             onIceRtt: (rttMs, ip, port) => this.#engine?.updateIceRtt(rttMs, ip, port),
         });
         // VOIP_WASM_LOG=1 surfaces the WASM's own internal logs, filtered to the
-        // call-setup lines. This is how the WASM's reason for rejecting an
-        // inbound offer becomes visible: the reject decision (event 92) is
-        // logged inside `preprocess_offer` with a human-readable reason that is
-        // otherwise dropped, because nothing wired `onLog`. Unfiltered WASM debug
-        // output is a firehose, so a keyword filter keeps it to what matters.
+        // call-setup lines. This is how the WASM's reason for rejecting an inbound
+        // offer becomes visible: the reject decision (event 92) is logged inside
+        // `preprocess_offer` with a human-readable reason that is otherwise dropped,
+        // because nothing wired `onLog`. Unfiltered WASM debug output is a firehose,
+        // so a keyword filter keeps it to what matters.
         const wasmLogEnabled = process.env.VOIP_WASM_LOG === "1";
         const wasmLogVerbose = process.env.VOIP_WASM_LOG === "2";
         const CALL_LOG_RE = /offer|reject|reason|preprocess|pending|contact|accept|missed|expired|silence|terminat|relay|call.?state|not.?authoriz|privacy/i;
@@ -391,6 +415,7 @@ export class VoipClient extends EventEmitter {
                 onAudioCaptureStart: () => this.#handleAudioCaptureStart(),
                 onAudioCaptureStop: () => this.#handleAudioCaptureStop(),
                 onAudioPlaybackData: (audioData) => this.#activeCall?._emitAudio(audioData),
+                onVideoFrame: (frame) => this.#activeCall?.emit("video", frame),
                 onLog: (level, message) => {
                     if (!wasmLogEnabled && !wasmLogVerbose)
                         return;
@@ -413,15 +438,15 @@ export class VoipClient extends EventEmitter {
         }
         catch { }
         this.#sock.ws.on("CB:call", (node) => {
-            // A peer hangup/decline arrives as <call><terminate>/<reject>. The
-            // WASM ignores it when it has no active call, so the active call would
-            // otherwise never end. End it here directly, before feeding onward.
+            // A peer hangup/decline arrives as <call><terminate>/<reject>. The WASM
+            // ignores it when it has no active call ("no active call, ignore message
+            // Terminate"), so the active call would otherwise never end. End it here
+            // directly, before feeding the node onward.
             this.#endActiveCallOnPeerTerminate(node);
-            // The WASM must have the offer before it can be accepted, and delivery
-            // is queued and can take seconds. Surfacing the call earlier meant
-            // answer() reached a WASM that had never heard of the call, so
-            // acceptCall() was a silent no-op — the call logged as answered and
-            // then just rang out.
+            // The WASM must have the offer before it can be accepted, and delivery is
+            // queued and can take seconds. Surfacing the call earlier meant answer()
+            // reached a WASM that had never heard of the call, so acceptCall() was a
+            // silent no-op — the call logged as answered and then just rang out.
             const delivered = this.#signaling.processIncomingCall(node, this.#engine, this.#activeCall?.callId ?? "");
             void delivered
                 .then(() => this.#handleIncomingOffer(node))
@@ -478,7 +503,69 @@ export class VoipClient extends EventEmitter {
         });
         return call;
     };
-    /** Tear down the WhatsApp socket and release resources. */
+    /**
+     * Place an outbound group call.
+     *
+     * Needs at least two other participants (WhatsApp's minimum for an initial
+     * group offer is self + 2). The WASM owns the group key epoch, SRTP, and relay
+     * subscriptions; this only resolves each participant's device roster and hands
+     * it over. Pass `groupJid` to bind the call to an existing group, or omit it
+     * for an ad-hoc group call.
+     */
+    callGroup = async (phoneNumbers, opts = {}) => {
+        if (!this.#engine || !this.#signaling)
+            throw new Error("Not connected. Call connect() first.");
+        if (this.#activeCall)
+            throw new Error("A call is already active.");
+        const numbers = [...new Set(phoneNumbers.map((n) => n.replace(/\D/g, "")).filter(Boolean))];
+        if (numbers.length < 2)
+            throw new Error("A group call needs at least two other participants.");
+        const pnUserJids = [];
+        const lidUserJids = [];
+        const deviceJidsCsv = [];
+        const allDevices = [];
+        for (const number of numbers) {
+            const resolved = await this.#signaling.resolveGroupParticipant(`${number}@s.whatsapp.net`);
+            if (!resolved)
+                throw new Error(`Could not resolve LID for ${number}`);
+            pnUserJids.push(resolved.pn);
+            lidUserJids.push(resolved.lid);
+            deviceJidsCsv.push(resolved.deviceCsv);
+            if (resolved.deviceCsv)
+                allDevices.push(...resolved.deviceCsv.split(","));
+        }
+        if (allDevices.length)
+            await this.#signaling.ensureSessionsForPeers(allDevices);
+        const callId = ("00" + randomBytes(16).toString("hex").slice(2)).toUpperCase();
+        const call = new ActiveCall(callId, this.#engine, opts.durationMs ?? 0);
+        call._audioSource = "silence";
+        call.isGroup = true;
+        this.#registerCall(call);
+        this.#registerGroupControls(call);
+        this.#engine.startGroupCall({
+            pnUserJids, lidUserJids, deviceJidsCsv, callId,
+            isVideo: !!opts.video, groupJid: opts.groupJid,
+        });
+        return call;
+    };
+    /** Wire add/remove-participant controls onto a group ActiveCall. */
+    #registerGroupControls = (call) => {
+        call._addParticipant = async (phoneNumber) => {
+            if (!this.#engine || !this.#signaling)
+                return;
+            const number = phoneNumber.replace(/\D/g, "");
+            const resolved = await this.#signaling.resolveGroupParticipant(`${number}@s.whatsapp.net`);
+            if (!resolved)
+                throw new Error(`Could not resolve LID for ${number}`);
+            const devices = resolved.deviceCsv ? resolved.deviceCsv.split(",") : [];
+            if (devices.length)
+                await this.#signaling.ensureSessionsForPeers(devices);
+            this.#engine.inviteToCall(resolved.pn, resolved.lid, devices);
+        };
+        call._removeParticipant = (jid) => {
+            this.#engine?.removeCallParticipant(jid);
+        };
+    };
     disconnect = async () => {
         this.#activeCall?._forceEnd("disconnect");
         this.#activeCall = null;
@@ -503,8 +590,8 @@ export class VoipClient extends EventEmitter {
      *
      * Shared by both directions. Without the `ended` handler `#activeCall` stayed
      * set for the lifetime of the client and every later call() threw "A call is
-     * already active."; it also stops the feeder, which otherwise leaks an
-     * ffmpeg process when a call ends without a WASM capture-stop report.
+     * already active."; it also stops the feeder, which otherwise leaks an ffmpeg
+     * process when a call ends without the WASM reporting a capture stop.
      */
     #registerCall = (call) => {
         // Resolved lazily: the feeder only exists once the WASM starts capturing.
@@ -512,9 +599,9 @@ export class VoipClient extends EventEmitter {
         call._clearAudio = () => this.#feeder?.flush() ?? 0;
         this.#activeCall = call;
         // Liveness watchdog: once connected, confirm the WASM still has an active
-        // call. If getCallInfo reports none twice in a row the call has ended
-        // without a terminate we could see (network drop, internal WASM end), so
-        // end it here rather than leave the session and feeder running forever.
+        // call. If getCallInfo reports none twice in a row the call has ended without
+        // a terminate we could see (network drop, internal WASM end), so end it here
+        // rather than leave the session and feeder running forever.
         let watchdog = null;
         let misses = 0;
         call.on("connected", () => {
@@ -621,8 +708,8 @@ export class VoipClient extends EventEmitter {
         const callId = String(offer.attrs?.["call-id"] ?? "");
         if (!callId || this.#seenIncomingCallIds.has(callId))
             return;
-        // An offer-shaped "call ended" notification is not a live call; engaging
-        // it earns an accept error from the server.
+        // An offer-shaped "call ended" notification is not a live call; engaging it
+        // earns an accept error from the server.
         if (offer.attrs?.is_call_ended === "1" || offer.attrs?.terminate_reason)
             return;
         this.#seenIncomingCallIds.add(callId);
@@ -635,6 +722,9 @@ export class VoipClient extends EventEmitter {
         const isGroup = !!offer.attrs?.["group-jid"] || children.some((c) => c.tag === "group_info");
         const call = new ActiveCall(callId, this.#engine, 0, true);
         call.peerJid = peerJid;
+        call.isGroup = isGroup;
+        if (isGroup)
+            this.#registerGroupControls(call);
         // Only one call can be up at a time: the WASM holds a single call context.
         if (this.#activeCall) {
             try {
@@ -646,12 +736,12 @@ export class VoipClient extends EventEmitter {
         }
         call._answer = ({ audioSource = "silence", withMic = true }) => {
             call._audioSource = audioSource;
-            // The WASM buffers the offer and reports no active call (getCallInfo
-            // status 670007) until the relay-latency handshake it drives
-            // internally finishes. Accepting before then fails and tears the call
-            // down. So poll until the call goes active, then accept exactly once.
-            // Incoming signaling (relaylatency/transport) keeps being fed to the
-            // WASM meanwhile, which is what advances the call to active.
+            // The WASM buffers the offer and reports no active call (getCallInfo status
+            // 670007) until the relay-latency handshake it drives internally finishes.
+            // Accepting before then fails and tears the call down. So poll until the
+            // call goes active, then accept exactly once. Incoming signaling
+            // (relaylatency/transport) keeps being fed to the WASM meanwhile, which is
+            // what advances the call to active.
             const deadline = Date.now() + ACCEPT_WAIT_MS;
             let logged = false;
             const waitThenAccept = () => {
@@ -694,10 +784,9 @@ export class VoipClient extends EventEmitter {
         };
         call._reject = () => {
             // The WASM's rejectCall is a no-op when it never made the call active
-            // (which is always, for inbound), so it never actually declined on
-            // the wire. Send the real <call><reject> stanza too — the same one
-            // WhatsApp Web / meowcaller send — so the caller's phone stops
-            // ringing.
+            // (which is always, for inbound), so it never actually declined on the
+            // wire. Send the real <call><reject> stanza too — the same one WhatsApp
+            // Web / meowcaller send — so the caller's phone stops ringing.
             void this.#sendRejectStanza(call.callId, call.peerJid);
             try {
                 this.#engine.rejectCall();
@@ -708,8 +797,8 @@ export class VoipClient extends EventEmitter {
         this.#registerCall(call);
         console.log(`[baileys-caller] incoming call ${callId} from ${peerJid}` +
             `${isVideo ? " (video)" : ""}${isGroup ? " (group)" : ""}`);
-        // Nothing listening means nobody can answer, and an unanswered offer
-        // just rings out — decline it explicitly instead.
+        // Nothing listening means nobody can answer, and an unanswered offer just
+        // rings out — decline it explicitly instead.
         if (this.listenerCount("incoming") === 0) {
             call._reject?.();
             return;
@@ -751,10 +840,10 @@ export class VoipClient extends EventEmitter {
             }
             catch { }
             const call = this.#activeCall;
-            // This event also fires for a failed accept on a not-yet-active call.
-            // If we have not accepted yet, it is setup churn from an earlier
-            // build's premature accept path — ignore it and let the call keep
-            // progressing. Once we have actually accepted, it is a real rejection.
+            // This event also fires for a failed accept on a not-yet-active call. If we
+            // have not accepted yet, it is setup churn from an earlier build's
+            // premature accept path — ignore it and let the call keep progressing.
+            // Once we have actually accepted, it is a real rejection.
             if (call && !call.incoming) {
                 console.log(`[baileys-caller] the WASM rejected call ${call.callId} (reason ${reason})`);
                 call._forceEnd(`wasm_rejected_${reason}`);

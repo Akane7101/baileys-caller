@@ -69,6 +69,10 @@ export type WasmEngineCallbacks = {
   onAudioPlaybackStart?: () => void;
   onAudioPlaybackStop?: () => void;
   onAudioPlaybackData?: (audioData: Float32Array) => void;
+  onVideoFrame?: (frame: {
+    userJid: string; data: Uint8Array; width: number; height: number;
+    orientation: number; format: number; isKeyFrame: boolean; timestamp: number;
+  }) => void;
   cryptoHkdf?: (key: Uint8Array, salt: Uint8Array | null, info: Uint8Array, length: number) => Uint8Array;
   hmacSha256?: (data: Uint8Array, key: Uint8Array) => Uint8Array;
 };
@@ -573,12 +577,111 @@ export class WasmEngine {
   };
 
   /**
-   * Answer the call the WASM is currently ringing on.
+   * Start an ad-hoc / group-bound group call.
    *
-   * The signalling itself (preaccept, relay election, accept) is driven inside
-   * the WASM once the offer has been handed to `handleSignalingOffer`; this only
-   * commits to the call and starts media.
+   * The WASM owns the group key epoch, SRTP, and relay subscriptions; this only
+   * hands it the roster. Needs the self device plus at least two remote
+   * participants, split into parallel PN / LID / device-CSV lists (the shape the
+   * WASM's `startVoipGroupCall` expects).
    */
+  startGroupCall = (options: {
+    pnUserJids: string[]; lidUserJids: string[]; deviceJidsCsv: string[];
+    callId: string; isVideo?: boolean; groupJid?: string;
+  }): unknown => {
+    this.#ensureInitialized();
+    if (typeof this.#instance.startVoipGroupCall !== "function") {
+      throw new Error("WASM exposes no startVoipGroupCall on this build");
+    }
+    const pn = this.#makeStringList(options.pnUserJids);
+    const lid = this.#makeStringList(options.lidUserJids);
+    const dev = this.#makeStringList(options.deviceJidsCsv);
+    try {
+      return this.#instance.startVoipGroupCall(
+        pn, lid, dev, options.callId, !!options.isVideo,
+        options.groupJid ?? "", false, "", "", "", 0, 0, "",
+      );
+    } finally {
+      pn?.delete?.(); lid?.delete?.(); dev?.delete?.();
+    }
+  };
+
+  /** Join a group call that is already ringing / ongoing. */
+  joinOngoingCall = (options: {
+    callId: string; callCreatorJid: string; initialPeerJid: string;
+    pnUserJids: string[]; lidUserJids: string[]; deviceJidsCsv: string[];
+    hasVideo?: boolean; groupJid?: string; initialGroupTransactionId?: number;
+    callCreatorIsNotContact?: boolean; joinAndAccept?: boolean;
+  }): unknown => {
+    this.#ensureInitialized();
+    if (typeof this.#instance.joinVoipOngoingCall !== "function") {
+      throw new Error("WASM exposes no joinVoipOngoingCall on this build");
+    }
+    const pn = this.#makeStringList(options.pnUserJids);
+    const lid = this.#makeStringList(options.lidUserJids);
+    const dev = this.#makeStringList(options.deviceJidsCsv);
+    try {
+      return this.#instance.joinVoipOngoingCall(
+        options.callId, options.callCreatorJid, options.initialPeerJid,
+        pn, lid, dev, !!options.hasVideo, options.groupJid ?? "",
+        options.initialGroupTransactionId ?? 0, !!options.callCreatorIsNotContact,
+        "", false, "", options.joinAndAccept ?? true, "", 0, false,
+      );
+    } finally {
+      pn?.delete?.(); lid?.delete?.(); dev?.delete?.();
+    }
+  };
+
+  /** Invite (add) a participant to the active group call. */
+  inviteToCall = (invitedPnUserJid: string, invitedLidUserJid: string, deviceJids: string[]): void => {
+    this.#ensureInitialized();
+    if (typeof this.#instance.inviteToCall !== "function") return;
+    const dev = this.#makeStringList(deviceJids);
+    try { this.#instance.inviteToCall(invitedPnUserJid, invitedLidUserJid, dev); }
+    finally { dev?.delete?.(); }
+  };
+
+  /** Remove a participant from the active group call. */
+  removeCallParticipant = (peerJid: string): void => {
+    this.#ensureInitialized();
+    if (typeof this.#instance.removeCallParticipant !== "function") return;
+    this.#instance.removeCallParticipant(peerJid);
+  };
+
+  /** Ask the peer to upgrade the current audio call to video. */
+  requestVideoUpgrade = (): void => {
+    this.#ensureInitialized();
+    if (typeof this.#instance.requestVideoUpgrade === "function") this.#instance.requestVideoUpgrade();
+  };
+
+  /** Accept an inbound peer's video (mid-call upgrade or group participant video). */
+  acceptPeerVideo = (jid: string): void => {
+    this.#ensureInitialized();
+    if (typeof this.#instance.acceptPeerVideo === "function") this.#instance.acceptPeerVideo(jid);
+  };
+
+  /** Re-broadcast our own video state to the call. */
+  broadcastVideoState = (): void => {
+    this.#ensureInitialized();
+    if (typeof this.#instance.broadcastVideoState === "function") this.#instance.broadcastVideoState();
+  };
+
+  /** Toggle our outgoing video track on/off. */
+  setVideoMute = (enable: boolean): void => {
+    this.#ensureInitialized();
+    if (typeof this.#instance.setCallVideoMute === "function") this.#instance.setCallVideoMute(enable);
+  };
+
+  /** Select which participants' video the relay should forward to us. */
+  updateParticipantsRxSubscription = (participantJids: string[], videoQualities: number[]): void => {
+    this.#ensureInitialized();
+    if (typeof this.#instance.updateParticipantsRxSubscription !== "function") return;
+    const jids = this.#makeStringList(participantJids);
+    const quals = this.#makeIntList(videoQualities);
+    try { this.#instance.updateParticipantsRxSubscription(jids, quals); }
+    finally { jids?.delete?.(); quals?.delete?.(); }
+  };
+
+
   acceptCall = (isMicEnabled = true, isCameraEnabled = false): void => {
     this.#ensureInitialized();
     let hasAccept = false;
@@ -791,6 +894,13 @@ export class WasmEngine {
   #makeStringList = (arr: string[]): any => {
     const list = new this.#instance.StringList();
     for (const v of arr) list.push_back(v);
+    return list;
+  };
+
+  #makeIntList = (arr: number[]): any => {
+    const Ctor = this.#instance.IntList ?? this.#instance.Int32List ?? this.#instance.StringList;
+    const list = new Ctor();
+    for (const v of arr) list.push_back(this.#instance.IntList || this.#instance.Int32List ? v : String(v));
     return list;
   };
 
@@ -1062,6 +1172,26 @@ export class WasmEngine {
         if (!ip || !portNum) return 0;
         callbacks.sendDataToRelay!(relayData, ip, portNum);
         return relayData.byteLength;
+      });
+    }
+
+    if (callbacks.onVideoFrame) {
+      this.#registerCallback("onVideoFrameWasmToJs", (data) => {
+        let buf = data.frameBuffer ?? data.frame_buffer;
+        if (buf instanceof ArrayBuffer) buf = new Uint8Array(buf);
+        else if (Array.isArray(buf)) buf = new Uint8Array(buf);
+        else if (Buffer.isBuffer(buf)) buf = new Uint8Array(buf);
+        else if (!(buf instanceof Uint8Array)) return;
+        callbacks.onVideoFrame!({
+          userJid: String(data.userJid ?? ""),
+          data: buf,
+          width: Number(data.width ?? 0),
+          height: Number(data.height ?? 0),
+          orientation: Number(data.orientation ?? 0),
+          format: Number(data.format ?? 0),
+          isKeyFrame: !!data.isKeyFrame,
+          timestamp: Number(data.timestamp ?? 0),
+        });
       });
     }
 

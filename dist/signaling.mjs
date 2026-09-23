@@ -93,9 +93,9 @@ export class SignalingBridge {
         this.#incomingSignalingQueue = this.#incomingSignalingQueue
             .then(() => this.#doProcessIncomingCall(node, voip, activeCallId))
             .catch((err) => {
-            // Swallowing this silently made an undeliverable offer
-            // indistinguishable from a delivered one: the call would be
-            // surfaced, accepted, and then ring out because the WASM never had it.
+            // Swallowing this silently made an undeliverable offer indistinguishable
+            // from a delivered one: the call would be surfaced, accepted, and then
+            // ring out because the WASM never had it.
             console.log("[baileys-caller] failed to process an inbound call node:", err?.message || err);
         });
         return this.#incomingSignalingQueue;
@@ -158,6 +158,19 @@ export class SignalingBridge {
         const devices = await this.#sock.getUSyncDevices([peerLidJid], true, false);
         return this.#normalizeStartCallPeerList(devices.map((d) => d.jid).filter(Boolean));
     };
+    /**
+     * Resolve one group-call target into the parallel wire lists the WASM's
+     * `startVoipGroupCall` / `joinVoipOngoingCall` expect: its PN JID, LID JID,
+     * and a comma-separated list of its device JIDs.
+     */
+    resolveGroupParticipant = async (pnJid) => {
+        const pn = this.#toBareJid(pnJid);
+        const lid = (await this.resolveLid(pn)) ?? "";
+        if (!lid)
+            return null;
+        const devices = await this.discoverPeerDevices(lid);
+        return { pn, lid: this.#toBareJid(lid), deviceCsv: devices.join(",") };
+    };
     ensureSessionsForPeers = async (jids) => {
         const targets = this.#expandSignalSessionTargets(jids);
         if (targets.length)
@@ -202,9 +215,9 @@ export class SignalingBridge {
         }
         const signalingTag = String(voipNode.tag);
         const effectivePeerJid = this.#resolveOutboundPeerJid(callId, peerJid);
-        // Diagnostic: reveals whether the WASM engages an inbound offer at all —
-        // a preaccept here means it took the call; silence before an event 92
-        // means it discarded the offer during preprocessing.
+        // Diagnostic: reveals whether the WASM engages an inbound offer at all — a
+        // preaccept here means it took the call; silence before an event 92 means it
+        // discarded the offer during preprocessing.
         console.log(`[baileys-caller] WASM -> sending <${signalingTag}> for call ${callId}`);
         if (signalingTag === "offer" && !voipNode.attrs["call-creator"]) {
             const selfLid = this.#sock.authState.creds.me?.lid;
@@ -321,8 +334,8 @@ export class SignalingBridge {
         if (getBinaryNodeChild(voipChild, "enc")) {
             usableNode = await this.#maybeDecryptEnc(voipChild, senderDeviceJid);
         }
-        // Diagnostic: an inbound offer that the WASM rejects tells us nothing
-        // about why unless we can see what the offer contained. Log its shape
+        // Diagnostic: an inbound offer that the WASM rejects tells us nothing about
+        // why unless we can see what the offer actually contained. Log its shape
         // once, so a rejection can be correlated with a missing attr or child.
         if (usableNode.tag === "offer") {
             const attrKeys = Object.keys(usableNode.attrs || {});
@@ -420,10 +433,10 @@ export class SignalingBridge {
         const type = enc.attrs.type;
         if (type !== "pkmsg" && type !== "msg")
             return voipNode;
-        // Calls are addressed by device, and increasingly by LID rather than
-        // phone number, so the session may live under any of these. Trying only
-        // the JID the stanza happened to carry meant a single mismatch left the
-        // call undecryptable — and therefore unanswerable.
+        // Calls are addressed by device, and increasingly by LID rather than phone
+        // number, so the session may live under any of these. Trying only the JID the
+        // stanza happened to carry meant a single mismatch left the call
+        // undecryptable — and therefore unanswerable.
         const counterpart = await this.#counterpartJid(peerJid);
         const candidates = [...new Set([
                 peerJid,
@@ -456,8 +469,8 @@ export class SignalingBridge {
         throw new Error(`could not decrypt the inbound call key (type=${type}); tried ${attempts.join(" | ")}`);
     };
     /**
-     * The other addressing form of a JID: LID for a phone number, phone number
-     * for a LID. Calls may be signalled under either, and the Signal session only
+     * The other addressing form of a JID: LID for a phone number, phone number for
+     * a LID. Calls may be signalled under either, and the Signal session only
      * exists under one of them.
      */
     #counterpartJid = async (jid) => {

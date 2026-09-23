@@ -17,7 +17,6 @@ import { fileURLToPath } from "node:url";
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const CALL_WASM_AB_PROPS_JSON = process.env.CALL_WASM_AB_PROPS_JSON ?? "";
-
 /**
  * Size of the pre-spawned pthread pool.
  *
@@ -251,9 +250,9 @@ export class WasmEngine {
      * Workers the Emscripten runtime asked for itself, via
      * `WorkerBundleResource.createDedicatedWebWorker`.
      *
-     * These are the majority of the threads in a running engine — the
-     * pre-spawned pool is only a head start — and nothing used to keep a
-     * reference to them, so `destroy()` left them all alive.
+     * These are the majority of the threads in a running engine — the pre-spawned
+     * pool is only a head start — and nothing used to keep a reference to them, so
+     * `destroy()` left them all alive.
      */
     #runtimeWorkers = new Set();
     #pthreads = {};
@@ -277,8 +276,8 @@ export class WasmEngine {
      * These used to be registered once per process behind a static flag, which
      * meant a second engine (after a `destroy()` and reconnect) silently
      * inherited the *dead* engine's handlers and never received its own — so
-     * signaling and audio went nowhere. Tracking them per instance lets
-     * destroy() unregister cleanly and a fresh engine register its own.
+     * signaling and audio went nowhere. Tracking them per instance lets destroy()
+     * unregister cleanly and a fresh engine register its own.
      */
     #registeredCallbacks = [];
     #registerCallback = (name, handler) => {
@@ -388,11 +387,10 @@ export class WasmEngine {
     /**
      * Tear the engine down and release the worker pool.
      *
-     * Returns a promise that settles once every worker thread has actually
-     * exited. `Worker.terminate()` is asynchronous, so the previous
-     * fire-and-forget version returned while ~20 threads were still alive,
-     * leaving several hundred MB resident. Awaiting it is what makes the memory
-     * come back.
+     * Returns a promise that settles once every worker thread has actually exited.
+     * `Worker.terminate()` is asynchronous, so the previous fire-and-forget
+     * version returned while ~20 threads were still alive, leaving several hundred
+     * MB resident. Awaiting it is what makes the memory come back.
      */
     destroy = async () => {
         this.#stopAudioPlaybackLoop();
@@ -402,8 +400,7 @@ export class WasmEngine {
             }
             catch { }
         }
-        // Let the runtime unwind its own pthreads first; it knows which are
-        // mid-call.
+        // Let the runtime unwind its own pthreads first; it knows which are mid-call.
         try {
             this.#instance?.PThread?.terminateAllThreads?.();
         }
@@ -441,8 +438,8 @@ export class WasmEngine {
         this.#removeRunDependencyCallback = null;
         this.#workersLoadedCount = 0;
         this.#nextWorkerID = 1;
-        // Reset VoIP-stack state so a fresh initialize()/initVoipStack() pair
-        // works instead of short-circuiting on stale flags.
+        // Reset VoIP-stack state so a fresh initialize()/initVoipStack() pair works
+        // instead of short-circuiting on stale flags.
         this.#voipStackInitialized = false;
         this.#voipStackInitPromise = null;
         this.#voipReadyPromise = null;
@@ -530,12 +527,107 @@ export class WasmEngine {
         }
     };
     /**
-     * Answer the call the WASM is currently ringing on.
+     * Start an ad-hoc / group-bound group call.
      *
-     * The signalling itself (preaccept, relay election, accept) is driven inside
-     * the WASM once the offer has been handed to `handleSignalingOffer`; this
-     * only commits to the call and starts media.
+     * The WASM owns the group key epoch, SRTP, and relay subscriptions; this only
+     * hands it the roster. Needs the self device plus at least two remote
+     * participants, split into parallel PN / LID / device-CSV lists (the shape the
+     * WASM's `startVoipGroupCall` expects).
      */
+    startGroupCall = (options) => {
+        this.#ensureInitialized();
+        if (typeof this.#instance.startVoipGroupCall !== "function") {
+            throw new Error("WASM exposes no startVoipGroupCall on this build");
+        }
+        const pn = this.#makeStringList(options.pnUserJids);
+        const lid = this.#makeStringList(options.lidUserJids);
+        const dev = this.#makeStringList(options.deviceJidsCsv);
+        try {
+            return this.#instance.startVoipGroupCall(pn, lid, dev, options.callId, !!options.isVideo, options.groupJid ?? "", false, "", "", "", 0, 0, "");
+        }
+        finally {
+            pn?.delete?.();
+            lid?.delete?.();
+            dev?.delete?.();
+        }
+    };
+    /** Join a group call that is already ringing / ongoing. */
+    joinOngoingCall = (options) => {
+        this.#ensureInitialized();
+        if (typeof this.#instance.joinVoipOngoingCall !== "function") {
+            throw new Error("WASM exposes no joinVoipOngoingCall on this build");
+        }
+        const pn = this.#makeStringList(options.pnUserJids);
+        const lid = this.#makeStringList(options.lidUserJids);
+        const dev = this.#makeStringList(options.deviceJidsCsv);
+        try {
+            return this.#instance.joinVoipOngoingCall(options.callId, options.callCreatorJid, options.initialPeerJid, pn, lid, dev, !!options.hasVideo, options.groupJid ?? "", options.initialGroupTransactionId ?? 0, !!options.callCreatorIsNotContact, "", false, "", options.joinAndAccept ?? true, "", 0, false);
+        }
+        finally {
+            pn?.delete?.();
+            lid?.delete?.();
+            dev?.delete?.();
+        }
+    };
+    /** Invite (add) a participant to the active group call. */
+    inviteToCall = (invitedPnUserJid, invitedLidUserJid, deviceJids) => {
+        this.#ensureInitialized();
+        if (typeof this.#instance.inviteToCall !== "function")
+            return;
+        const dev = this.#makeStringList(deviceJids);
+        try {
+            this.#instance.inviteToCall(invitedPnUserJid, invitedLidUserJid, dev);
+        }
+        finally {
+            dev?.delete?.();
+        }
+    };
+    /** Remove a participant from the active group call. */
+    removeCallParticipant = (peerJid) => {
+        this.#ensureInitialized();
+        if (typeof this.#instance.removeCallParticipant !== "function")
+            return;
+        this.#instance.removeCallParticipant(peerJid);
+    };
+    /** Ask the peer to upgrade the current audio call to video. */
+    requestVideoUpgrade = () => {
+        this.#ensureInitialized();
+        if (typeof this.#instance.requestVideoUpgrade === "function")
+            this.#instance.requestVideoUpgrade();
+    };
+    /** Accept an inbound peer's video (mid-call upgrade or group participant video). */
+    acceptPeerVideo = (jid) => {
+        this.#ensureInitialized();
+        if (typeof this.#instance.acceptPeerVideo === "function")
+            this.#instance.acceptPeerVideo(jid);
+    };
+    /** Re-broadcast our own video state to the call. */
+    broadcastVideoState = () => {
+        this.#ensureInitialized();
+        if (typeof this.#instance.broadcastVideoState === "function")
+            this.#instance.broadcastVideoState();
+    };
+    /** Toggle our outgoing video track on/off. */
+    setVideoMute = (enable) => {
+        this.#ensureInitialized();
+        if (typeof this.#instance.setCallVideoMute === "function")
+            this.#instance.setCallVideoMute(enable);
+    };
+    /** Select which participants' video the relay should forward to us. */
+    updateParticipantsRxSubscription = (participantJids, videoQualities) => {
+        this.#ensureInitialized();
+        if (typeof this.#instance.updateParticipantsRxSubscription !== "function")
+            return;
+        const jids = this.#makeStringList(participantJids);
+        const quals = this.#makeIntList(videoQualities);
+        try {
+            this.#instance.updateParticipantsRxSubscription(jids, quals);
+        }
+        finally {
+            jids?.delete?.();
+            quals?.delete?.();
+        }
+    };
     acceptCall = (isMicEnabled = true, isCameraEnabled = false) => {
         this.#ensureInitialized();
         let hasAccept = false;
@@ -586,9 +678,8 @@ export class WasmEngine {
             for (const key of Object.getOwnPropertyNames(obj)) {
                 if (!/call/i.test(key))
                     continue;
-                // Emscripten installs throwing getters for symbols it did not
-                // export, so merely reading a property can abort the runtime.
-                // Probe defensively.
+                // Emscripten installs throwing getters for symbols it did not export, so
+                // merely reading a property can abort the runtime. Probe defensively.
                 try {
                     if (typeof this.#instance[key] === "function")
                         names.add(key);
@@ -720,6 +811,13 @@ export class WasmEngine {
             list.push_back(v);
         return list;
     };
+    #makeIntList = (arr) => {
+        const Ctor = this.#instance.IntList ?? this.#instance.Int32List ?? this.#instance.StringList;
+        const list = new Ctor();
+        for (const v of arr)
+            list.push_back(this.#instance.IntList || this.#instance.Int32List ? v : String(v));
+        return list;
+    };
     #createUint8List = (data) => {
         if (!this.#instance?.Uint8List)
             return null;
@@ -762,11 +860,10 @@ export class WasmEngine {
                 const numFloats = Math.floor(bufferSize / 4);
                 if (index < 0 || index + numFloats > heapF32.length)
                     return;
-                // A view straight into WASM heap memory: the next poll (16 ms
-                // later) overwrites the same region. Anything a consumer holds
-                // on to — a queue, a batch to send over a socket — would
-                // silently read whatever landed there last, so hand out a
-                // detached copy instead of the live view.
+                // A view straight into WASM heap memory: the next poll (16 ms later)
+                // overwrites the same region. Anything a consumer holds on to — a queue,
+                // a batch to send over a socket — would silently read whatever landed
+                // there last, so hand out a detached copy instead of the live view.
                 const view = new Float32Array(heapF32.buffer, heapF32.byteOffset + index * 4, numFloats);
                 const hasNonZero = view.some((s) => Math.abs(s) > 0.0001);
                 if (hasNonZero)
@@ -822,8 +919,11 @@ export class WasmEngine {
             opus_max_bandwidth: 1103, // OPUS_BANDWIDTH_WIDEBAND
         };
         const boolProps = {
-            // Keep inbound offers on the normal ringing-call path. The pending
-            // companion-call path needs host callbacks this integration lacks.
+            // Companion-device builds can default inbound offers into a pending-call
+            // holding path. That path expects WhatsApp Web host callbacks which are not
+            // present here, so it immediately auto-rejects the offer (event 92) before
+            // acceptCall() can see a ringing call. Keep 1:1 offers on the normal call
+            // path; overlapping calls are already rejected by VoipClient.
             enable_pending_call: false,
             enable_av_downgrade: false,
             enable_new_user_action_stanza_for_raise_hand_sender: false,
@@ -999,6 +1099,29 @@ export class WasmEngine {
                     return 0;
                 callbacks.sendDataToRelay(relayData, ip, portNum);
                 return relayData.byteLength;
+            });
+        }
+        if (callbacks.onVideoFrame) {
+            this.#registerCallback("onVideoFrameWasmToJs", (data) => {
+                let buf = data.frameBuffer ?? data.frame_buffer;
+                if (buf instanceof ArrayBuffer)
+                    buf = new Uint8Array(buf);
+                else if (Array.isArray(buf))
+                    buf = new Uint8Array(buf);
+                else if (Buffer.isBuffer(buf))
+                    buf = new Uint8Array(buf);
+                else if (!(buf instanceof Uint8Array))
+                    return;
+                callbacks.onVideoFrame({
+                    userJid: String(data.userJid ?? ""),
+                    data: buf,
+                    width: Number(data.width ?? 0),
+                    height: Number(data.height ?? 0),
+                    orientation: Number(data.orientation ?? 0),
+                    format: Number(data.format ?? 0),
+                    isKeyFrame: !!data.isKeyFrame,
+                    timestamp: Number(data.timestamp ?? 0),
+                });
             });
         }
     };

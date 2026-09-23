@@ -36,9 +36,44 @@ export type CallEvents = {
   connected: () => void;
   /** 16 kHz mono Float32 PCM frame from the remote peer. */
   audio: (pcm: Float32Array) => void;
+  /**
+   * Encoded H.264 access unit from a peer's camera. The WASM does not decode
+   * pixels in this headless build, so `data` is the raw compressed frame — hand
+   * it to an external decoder (ffmpeg/WebCodecs) if you need images.
+   */
+  video: (frame: VideoFrame) => void;
+  /** Peer's mid-call video state changed (upgrade request/accept, enable/stop). */
+  videoState: (state: { jid: string; state: number }) => void;
+  /** Group roster changed (participant joined/left/connected). */
+  participants: (roster: unknown) => void;
   /** Reason: `"hangup"` | `"timeout"` | `"rejected"` | `"remote_end"` | `"disconnect"` | etc. */
   ended: (reason: string) => void;
   error: (err: Error) => void;
+};
+
+/** One encoded video frame received from a peer. */
+export type VideoFrame = {
+  /** The peer device this frame is attributed to. */
+  userJid: string;
+  /** Encoded H.264 access unit (Annex-B). Not decoded to pixels. */
+  data: Uint8Array;
+  width: number;
+  height: number;
+  /** Clockwise quarter turns to display upright (0..3). */
+  orientation: number;
+  format: number;
+  isKeyFrame: boolean;
+  timestamp: number;
+};
+
+/** Options for placing a group call. */
+export type GroupCallOptions = {
+  /** Start the call with video advertised in the offer. */
+  video?: boolean;
+  /** Bind the call to an existing group JID (`...@g.us`). Omit for ad-hoc. */
+  groupJid?: string;
+  /** Auto-hangup after N ms. Omit or `0` for no automatic hangup. */
+  durationMs?: number;
 };
 
 /** Top-level SDK configuration. */

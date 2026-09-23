@@ -73,7 +73,7 @@ export class AudioFeeder {
 
   readonly #streamInput: StreamInput | null;
   /** Leftover bytes of a partial input frame, carried between writes. */
-  #streamRemainder = Buffer.alloc(0);
+  #streamRemainder: Buffer = Buffer.alloc(0);
   /** Samples resampled but not yet chunked. */
   #streamSamples: number[] = [];
   /** Fractional read position into the input stream, for resampling. */
@@ -183,7 +183,7 @@ export class AudioFeeder {
 
     const buf = Buffer.isBuffer(chunk)
       ? chunk
-      : Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
+      : Buffer.from(chunk.buffer as ArrayBuffer, chunk.byteOffset, chunk.byteLength);
     this.bytesWritten += buf.byteLength;
 
     const { bytes, read } = STREAM_CODECS[input.codec]!;

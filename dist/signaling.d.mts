@@ -29,12 +29,28 @@ export declare class SignalingBridge {
     attachEngine: (voip: any) => void;
     init: () => Promise<void>;
     sendSignaling: (peerJid: string, callId: string, xmlPayload: Uint8Array) => void;
-    /** Queue an inbound call node for the WASM; resolves once it has been delivered. */
+    /**
+     * Queue an inbound `<call>` node for delivery to the WASM.
+     *
+     * Returns the queue promise: processing is serialised and can take seconds (a
+     * tc-token fetch alone allows up to TC_TOKEN_REQUEST_TIMEOUT_MS), and an
+     * inbound offer cannot be accepted before the WASM has actually received it.
+     */
     processIncomingCall: (node: any, voip: any, activeCallId: string) => Promise<void>;
     processIncomingReceipt: (node: any, voip: any, activeCallId: string) => void;
     requestTcToken: (jid: string) => Promise<Uint8Array | undefined>;
     ensureTcToken: (...jids: string[]) => Promise<Uint8Array | undefined>;
     discoverPeerDevices: (peerLidJid: string) => Promise<string[]>;
+    /**
+     * Resolve one group-call target into the parallel wire lists the WASM's
+     * `startVoipGroupCall` / `joinVoipOngoingCall` expect: its PN JID, LID JID,
+     * and a comma-separated list of its device JIDs.
+     */
+    resolveGroupParticipant: (pnJid: string) => Promise<{
+        pn: string;
+        lid: string;
+        deviceCsv: string;
+    } | null>;
     ensureSessionsForPeers: (jids: string[]) => Promise<void>;
     resolveLid: (pnJid: string) => Promise<string | undefined>;
     issueTcToken: (jid: string) => Promise<boolean>;
