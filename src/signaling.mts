@@ -269,6 +269,16 @@ export class SignalingBridge {
     // discarded the offer during preprocessing.
     console.log(`[baileys-caller] WASM -> sending <${signalingTag}> for call ${callId}`);
 
+    // A group offer is addressed to `<callId>@call`, not to a peer device (this
+    // is how WhatsApp routes it to the whole roster). A 1:1 offer is addressed to
+    // the peer's device. Detect the group case by the group_info child / group-jid.
+    const isGroupOffer = signalingTag === "offer" &&
+      (!!getBinaryNodeChild(voipNode, "group_info") || !!voipNode.attrs?.["group-jid"]);
+    if (isGroupOffer) {
+      const kids = getNodeChildren(voipNode).map((c: any) => c.tag).join(",");
+      console.log(`[baileys-caller] group offer ${callId} children=[${kids}] attrs=[${Object.keys(voipNode.attrs || {}).join(",")}]`);
+    }
+
     if (signalingTag === "offer" && !voipNode.attrs["call-creator"]) {
       const selfLid = this.#sock.authState.creds.me?.lid;
       if (selfLid) voipNode.attrs["call-creator"] = selfLid;
@@ -303,7 +313,10 @@ export class SignalingBridge {
       }
       if (includeDeviceIdentity) this.#appendDeviceIdentity(voipNode);
 
-      await this.#sendCallStanza(this.#toBareJid(peerJid), voipNode, signalingTag, effectivePeerJid, peerJid);
+      // Group offers route to `<callId>@call` so the server fans them out to the
+      // whole roster; a 1:1 multi-device offer routes to the peer's bare JID.
+      const destRouteTo = isGroupOffer ? `${callId}@call` : this.#toBareJid(peerJid);
+      await this.#sendCallStanza(destRouteTo, voipNode, signalingTag, effectivePeerJid, peerJid);
       return;
     }
 
@@ -316,15 +329,18 @@ export class SignalingBridge {
         replaceNodeChild(voipNode, "enc", encrypted.encNode);
         if (encrypted.shouldIncludeDeviceIdentity) this.#appendDeviceIdentity(voipNode);
 
-        await this.#sendCallStanza(targetJid, voipNode, signalingTag, effectivePeerJid, peerJid);
+        const encRouteTo = isGroupOffer ? `${callId}@call` : targetJid;
+        await this.#sendCallStanza(encRouteTo, voipNode, signalingTag, effectivePeerJid, peerJid);
         return;
       }
     }
 
     // Non-encrypted signaling (accept, transport, terminate, etc.).
-    const routeTo = signalingTag !== "offer" && signalingTag !== "enc_rekey"
-      ? this.#toBareJid(effectivePeerJid)
-      : this.#toCallDeviceJid(effectivePeerJid);
+    const routeTo = isGroupOffer
+      ? `${callId}@call`
+      : (signalingTag !== "offer" && signalingTag !== "enc_rekey")
+        ? this.#toBareJid(effectivePeerJid)
+        : this.#toCallDeviceJid(effectivePeerJid);
     await this.#sendCallStanza(routeTo, voipNode, signalingTag, effectivePeerJid, peerJid);
   };
 
